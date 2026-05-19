@@ -1,0 +1,43 @@
+# EKF Environment Configuration
+
+environment:
+  state_dim: 6          # [px, py, theta, vx, vy, omega]
+  meas_dim: 2           # [px_meas, py_meas]
+  dt: 0.1               # timestep (10 Hz)
+  episode_length: 200   # steps per episode
+
+  # Nominal noise (agent scales these)
+  q_nominal: 0.1
+  r_nominal: 1.0
+
+  # Innovation buffer
+  innovation_window: 32
+
+  # Action bounds
+  action_low: 0.1
+  action_high: 10.0
+
+  # Number of Q/R elements controlled
+  n_q: 6
+  n_r: 2
+
+# Task sampler
+task_sampler:
+  state_dim: 6
+  meas_dim: 2
+  q_range: [0.01, 1.0]
+  r_range: [0.1, 10.0]
+  trajectory_types:
+    - circle
+    - figure8
+    - straight
+    - random_walk
+  regime_probs:
+    stationary: 0.25
+    abrupt_change: 0.35
+    slow_drift: 0.20
+    periodic: 0.20
+  change_time_range: [50, 150]
+  change_factor_range: [2.0, 10.0]
+
+ 
