@@ -34,3 +34,22 @@ agent:
   # ST-SIE encoder
   stft_window: 16
   stft_hop: 4
+
+# Training
+training:
+  n_epochs: 300
+  tasks_per_epoch: 4
+  context_episodes: 1
+  train_episodes: 2
+  gradient_steps: 30
+  eval_interval: 10
+  save_interval: 50
+  buffer_capacity: 50000
+  buffer_max_tasks: 200
+
+# Logging
+logging:
+  log_dir: "runs/"
+  log_interval: 1
+
+ 
