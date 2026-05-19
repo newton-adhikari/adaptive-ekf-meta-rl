@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+*.pt
+runs/
+.pytest_cache/
+notebooks/.ipynb_checkpoints/
+results/
+checkpoints/
+ 
