@@ -1,0 +1,64 @@
+# trying to make evaluation config driven with this
+# Evaluation Configuration
+
+evaluation:
+  n_eval_episodes: 50
+  deterministic: true
+  save_trajectories: true
+  output_dir: "results/"
+
+  # Metrics to compute
+  metrics:
+    - nees
+    - nis
+    - rmse
+    - position_rmse
+    - heading_rmse
+    - consistency_rate
+    - anees
+
+  # Baselines to evaluate
+  baselines:
+    - fixed_ekf
+    - sage_husa
+    - innovation_adaptive
+    - variational_bayes_ekf
+    - rls_covariance
+    - gp_bayesopt_ekf
+    - supervised_ekf
+    - oracle_ekf
+
+  # Ablation variants
+  ablations:
+    - name: "naive_pearl"
+      encoder: "raw"
+      constraint: "soft_reward"
+    - name: "stsie_soft"
+      encoder: "st_sie"
+      constraint: "soft_reward"
+    - name: "cc_metaekf"
+      encoder: "st_sie"
+      constraint: "pid_ccpo"
+
+  # Test scenarios
+  scenarios:
+    - name: "stationary"
+      noise_regime: "stationary"
+    - name: "abrupt_change"
+      noise_regime: "abrupt_change"
+    - name: "slow_drift"
+      noise_regime: "slow_drift"
+    - name: "periodic"
+      noise_regime: "periodic"
+    - name: "sensor_degradation"
+      noise_regime: "abrupt_change"
+      change_factor: 20.0
+
+  # Plotting
+  plots:
+    nees_over_time: true
+    rmse_bar: true
+    adaptation_dynamics: true
+    spectrogram: true
+    consistency_vs_delta: true
+ 
