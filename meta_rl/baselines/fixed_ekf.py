@@ -12,3 +12,16 @@ class FixedEKFAdapter:
     def __init__(self, Q_nominal: np.ndarray, R_nominal: np.ndarray):
         self.Q = Q_nominal.copy()
         self.R = R_nominal.copy()
+
+    
+    def adapt(
+        self,
+        innovation: np.ndarray,
+        P: np.ndarray,
+        S: np.ndarray,
+        **kwargs,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return self.Q, self.R
+
+    def reset(self):
+        pass
