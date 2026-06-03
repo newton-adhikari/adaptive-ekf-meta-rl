@@ -46,3 +46,14 @@ class SupervisedNoisePredictor(nn.Module):
         x = innovation_window.flatten(start_dim=1)
         return self.net(x)
 
+
+class SupervisedNNAdapter:
+    """Supervised NN adapter for EKF noise estimation.
+
+    This will wrap the trained SupervisedNoisePredictor for use as a baseline.
+    """
+
+    def __init__(
+        self
+    ):
+        
