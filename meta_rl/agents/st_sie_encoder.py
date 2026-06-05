@@ -39,3 +39,11 @@ class SpectralCNN(nn.Module):
         """
         x = self.conv(spectrogram)
         return x.flatten(start_dim=1)
+
+
+class FilterStateEncoder(nn.Module):
+    """This encodes filter diagnostics (NEES, NIS, tr(P), diag(S)) into tokens."""
+
+    def __init__():
+        super().__init__()
+        
