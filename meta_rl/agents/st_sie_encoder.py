@@ -46,4 +46,15 @@ class FilterStateEncoder(nn.Module):
 
     def __init__():
         super().__init__()
-        
+        self.fc = nn.Sequential(
+            nn.Linear(filter_state_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
+    def forward(self, filter_state: torch.Tensor) -> torch.Tensor:
+        """
+        Returns:
+            tokens: (B, 1, embed_dim) — single query token.
+        """
+        return self.fc(filter_state).unsqueeze(1)
