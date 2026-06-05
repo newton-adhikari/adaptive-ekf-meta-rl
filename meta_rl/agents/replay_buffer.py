@@ -27,3 +27,16 @@ class Batch:
     innovation_windows: torch.Tensor
     filter_states: torch.Tensor
     constraint_violations: torch.Tensor
+
+
+class MultiTaskReplayBuffer:
+    """Replay buffer that stores transitions per task.
+
+    - Random batch across all tasks (for critic updates).
+    - Per-task context windows (for encoder).
+    - Balanced sampling across tasks.
+
+    """
+
+    def __init__(self):
+        pass
