@@ -9,3 +9,11 @@ Simple architecture:
   → 2D-CNN → Spectral tokens (K/V)
   → Cross-attention with filter state (Q) → Latent context z
 """
+
+
+class SpectralCNN(nn.Module):
+    """This si a simple lightweight 2D-CNN over log-power spectrogram (time × frequency)."""
+
+    def __init__(self):
+        super().__init__()
+        
