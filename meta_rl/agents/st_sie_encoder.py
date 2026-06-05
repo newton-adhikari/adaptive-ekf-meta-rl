@@ -33,6 +33,9 @@ class SpectralCNN(nn.Module):
     def forward(self, spectrogram: torch.Tensor) -> torch.Tensor:
         """
         spectrogram: (B, C, n_frames, n_freq) log-power spectrogram.
+        
+        Returns:
+            features: (B, out_dim) flattened CNN features.
         """
         x = self.conv(spectrogram)
         return x.flatten(start_dim=1)
