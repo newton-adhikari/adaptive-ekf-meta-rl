@@ -3,6 +3,11 @@ Multi-task replay buffer for meta-RL training.
 Stores transitions grouped by task for context-based meta-learning.
 """
 
+import numpy as np
+import torch
+from dataclasses import dataclass
+from typing import Optional
+from collections import defaultdict
 
 @dataclass
 class Transition:
@@ -38,5 +43,9 @@ class MultiTaskReplayBuffer:
 
     """
 
-    def __init__(self):
-        pass
+    def __init__(self, capacity: int = 100_000, max_tasks: int = 500):
+        self.capacity = capacity
+        self.max_tasks = max_tasks
+        self._buffers: dict[int, list[Transition]] = defaultdict(list)
+        self._positions: dict[int, int] = defaultdict(int)
+        self._total_size = 0
