@@ -114,12 +114,94 @@ def run_agent_episode(
     }
 
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pt")
     parser.add_argument("--config", type=str, default="configs/eval_config.yaml")
     parser.add_argument("--output_dir", type=str, default="results/")
     args = parser.parse_args()
+
+    config = load_config(args.config)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Environment
+    env = LightweightEKFEnv()
+
+    # Load agent
+    agent_config = {"device": "cpu", "encoder_type": "st_sie"}
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.shape[0]
+    agent = PIDCCPOAgent(
+        state_dim=obs_dim, action_dim=act_dim,
+        config=agent_config,
+    )
+    if Path(args.checkpoint).exists():
+        agent.load(args.checkpoint)
+        print(f"Loaded checkpoint: {args.checkpoint}")
+
+    # Setup baselines
+    Q_nom = np.eye(6) * 0.1
+    R_nom = np.eye(2) * 1.0
+    baselines = {
+        "Fixed EKF": FixedEKFAdapter(Q_nom, R_nom),
+        "Sage-Husa": SageHusaAdapter(Q_nom, R_nom),
+        "Innovation-Based": InnovationAdaptiveAdapter(Q_nom, R_nom),
+        "VB-EKF": VBEKFAdapter(Q_nom, R_nom),
+        "RLS Covariance": RLSCovarianceAdapter(Q_nom, R_nom),
+        "Oracle EKF": OracleEKFAdapter(),
+    }
+
+    # Test tasks
+    sampler = TaskSampler()
+    rng = np.random.default_rng(123)
+    test_tasks = sampler.sample_batch(
+        config.get("evaluation", {}).get("n_eval_episodes", 50), rng
+    )
+
+    all_results = {}
+
+    # Evaluate baselines
+    for name, adapter in baselines.items():
+        print(f"Evaluating: {name}")
+        task_results = []
+        for task in test_tasks:
+            adapter.reset()
+            if name == "Oracle EKF":
+                adapter.set_noise_schedule(task.get_noise)
+            result = run_baseline_episode(env, adapter, task)
+            task_results.append(result)
+
+        avg_consistency = np.mean([r["consistency_rate"] for r in task_results])
+        avg_anees = np.mean([r["anees"] for r in task_results])
+        all_results[name] = {
+            "consistency_rate": float(avg_consistency),
+            "anees": float(avg_anees),
+        }
+        print(f"  Consistency: {avg_consistency:.3f} | ANEES: {avg_anees:.3f}")
+
+    # Evaluate CC-MetaEKF
+    print("Evaluating: CC-MetaEKF")
+    task_results = []
+    for task in test_tasks:
+        result = run_agent_episode(env, agent, task)
+        task_results.append(result)
+
+    avg_consistency = np.mean([r["consistency_rate"] for r in task_results])
+    avg_anees = np.mean([r["anees"] for r in task_results])
+    all_results["CC-MetaEKF"] = {
+        "consistency_rate": float(avg_consistency),
+        "anees": float(avg_anees),
+    }
+    print(f"  Consistency: {avg_consistency:.3f} | ANEES: {avg_anees:.3f}")
+
+    # Save results
+    with open(output_dir / "evaluation_results.json", "w") as f:
+        json.dump(all_results, f, indent=2)
+
+    print(f"\nResults saved to {output_dir / 'evaluation_results.json'}")
+
 
 if __name__ == "__main__":
     main()
