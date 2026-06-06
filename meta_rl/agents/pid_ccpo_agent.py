@@ -230,7 +230,7 @@ class PIDCCPOAgent:
         filter_state: np.ndarray,
         deterministic: bool = False,
     ) -> np.ndarray:
-
+    
         """Select action given current observation and context."""
         with torch.no_grad():
             s = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
@@ -366,3 +366,37 @@ class PIDCCPOAgent:
     def _soft_update(self, source: nn.Module, target: nn.Module):
         for sp, tp in zip(source.parameters(), target.parameters()):
             tp.data.copy_(self.tau * sp.data + (1 - self.tau) * tp.data)
+
+    def save(self, path: str):
+        torch.save({
+            "encoder": self.encoder.state_dict(),
+            "policy": self.policy.state_dict(),
+            "q1": self.q1.state_dict(),
+            "q2": self.q2.state_dict(),
+            "cost_critic": self.cost_critic.state_dict(),
+            "log_alpha": self.log_alpha.data,
+            "pid_lambda": self.pid.value,
+            "pid_integral": self.pid._integral,
+            "update_step": self._update_step,
+            "obs_normalizer": self.obs_normalizer.state_dict(),
+            "reward_normalizer": self.reward_normalizer.state_dict(),
+        }, path)
+
+    def load(self, path: str):
+        ckpt = torch.load(path, map_location=self.device)
+        self.encoder.load_state_dict(ckpt["encoder"])
+        self.policy.load_state_dict(ckpt["policy"])
+        self.q1.load_state_dict(ckpt["q1"])
+        self.q2.load_state_dict(ckpt["q2"])
+        self.cost_critic.load_state_dict(ckpt["cost_critic"])
+        self.log_alpha.data = ckpt["log_alpha"]
+        self.pid._lambda = ckpt["pid_lambda"]
+        self.pid._integral = ckpt.get("pid_integral", 0.0)
+        self._update_step = ckpt["update_step"]
+        if "obs_normalizer" in ckpt:
+            self.obs_normalizer.load_state_dict(ckpt["obs_normalizer"])
+        if "reward_normalizer" in ckpt:
+            self.reward_normalizer.load_state_dict(ckpt["reward_normalizer"])
+        self.q1_target = deepcopy(self.q1)
+        self.q2_target = deepcopy(self.q2)
+        self.cost_critic_target = deepcopy(self.cost_critic)
