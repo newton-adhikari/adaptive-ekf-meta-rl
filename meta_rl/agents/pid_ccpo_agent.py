@@ -222,3 +222,147 @@ class PIDCCPOAgent:
         self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=lr)
 
         self._update_step = 0
+
+    def select_action(
+        self,
+        state: np.ndarray,
+        innovation_window: np.ndarray,
+        filter_state: np.ndarray,
+        deterministic: bool = False,
+    ) -> np.ndarray:
+
+        """Select action given current observation and context."""
+        with torch.no_grad():
+            s = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+            # Normalize observation
+            s = self.obs_normalizer.normalize(s)
+
+            iw = torch.tensor(
+                innovation_window, dtype=torch.float32, device=self.device
+            ).unsqueeze(0)
+            fs = torch.tensor(
+                filter_state, dtype=torch.float32, device=self.device
+            ).unsqueeze(0)
+
+            z = self.encoder(iw, fs)
+
+            if deterministic:
+                action = self.policy.deterministic(s, z)
+            else:
+                action, _ = self.policy.sample(s, z)
+
+        return action.cpu().numpy().squeeze(0)
+
+    def update(self, batch: Batch) -> dict:
+        """Perform one gradient step on all components."""
+        
+        #  Normalize observations and rewards 
+        self.obs_normalizer.update(batch.states.cpu().numpy())
+        self.reward_normalizer.update(
+            (batch.rewards * self.reward_scale).cpu().numpy()
+        )
+
+        states = self.obs_normalizer.normalize(batch.states)
+        next_states = self.obs_normalizer.normalize(batch.next_states)
+        rewards = self.reward_normalizer.normalize(batch.rewards * self.reward_scale)
+
+        # Encode context
+        z = self.encoder(batch.innovation_windows, batch.filter_states)
+        z_detached = z.detach()
+
+        #  Critic update 
+        with torch.no_grad():
+            next_z = z_detached
+            next_actions, next_log_probs = self.policy.sample(next_states, next_z)
+            q1_next = self.q1_target(next_states, next_actions, next_z)
+            q2_next = self.q2_target(next_states, next_actions, next_z)
+            q_next = torch.min(q1_next, q2_next) - self.log_alpha.exp() * next_log_probs
+            q_target = rewards + (1 - batch.dones) * self.gamma * q_next
+
+        q1_pred = self.q1(states, batch.actions, z_detached)
+        q2_pred = self.q2(states, batch.actions, z_detached)
+        q_loss = F.mse_loss(q1_pred, q_target) + F.mse_loss(q2_pred, q_target)
+
+        self.q_optimizer.zero_grad()
+        q_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q1.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.q2.parameters(), 1.0)
+        self.q_optimizer.step()
+
+        #  Cost critic update 
+        with torch.no_grad():
+            cost_next = self.cost_critic_target(next_states, next_actions, next_z)
+            cost_target = batch.constraint_violations + (
+                1 - batch.dones
+            ) * self.gamma * cost_next
+
+        cost_pred = self.cost_critic(states, batch.actions, z_detached)
+        cost_loss = F.mse_loss(cost_pred, cost_target)
+
+        self.cost_optimizer.zero_grad()
+        cost_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.cost_critic.parameters(), 1.0)
+        self.cost_optimizer.step()
+
+        #  Policy + Encoder update 
+        z_for_policy = self.encoder(batch.innovation_windows, batch.filter_states)
+        actions_new, log_probs_new = self.policy.sample(states, z_for_policy)
+        q1_new = self.q1(states, actions_new, z_for_policy)
+        q2_new = self.q2(states, actions_new, z_for_policy)
+        q_new = torch.min(q1_new, q2_new)
+
+        cost_new = self.cost_critic(states, actions_new, z_for_policy)
+
+        # Normalize Q-values to stabilize policy gradient
+        q_scale = max(q_new.abs().mean().item(), 1.0)
+        q_normalized = q_new / q_scale
+
+        alpha = self.log_alpha.exp().detach()
+        lam = self.pid.value
+
+        policy_loss = (
+            alpha * log_probs_new - q_normalized + lam * cost_new
+        ).mean()
+
+        self.encoder_optimizer.zero_grad()
+        self.policy_optimizer.zero_grad()
+        policy_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+        self.encoder_optimizer.step()
+        self.policy_optimizer.step()
+
+        #  Alpha update 
+        alpha_loss = -(
+            self.log_alpha * (log_probs_new.detach() + self.target_entropy)
+        ).mean()
+
+        self.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optimizer.step()
+
+        #  PID-Lagrangian update 
+        avg_violation = batch.constraint_violations.mean().item()
+        self.pid.update(avg_violation)
+
+        #  Soft target updates 
+        self._soft_update(self.q1, self.q1_target)
+        self._soft_update(self.q2, self.q2_target)
+        self._soft_update(self.cost_critic, self.cost_critic_target)
+
+        self._update_step += 1
+
+        return {
+            "q_loss": q_loss.item(),
+            "cost_loss": cost_loss.item(),
+            "policy_loss": policy_loss.item(),
+            "alpha_loss": alpha_loss.item(),
+            "alpha": self.log_alpha.exp().item(),
+            "lambda": self.pid.value,
+            "avg_violation": avg_violation,
+            "update_step": self._update_step,
+        }
+
+    def _soft_update(self, source: nn.Module, target: nn.Module):
+        for sp, tp in zip(source.parameters(), target.parameters()):
+            tp.data.copy_(self.tau * sp.data + (1 - self.tau) * tp.data)
