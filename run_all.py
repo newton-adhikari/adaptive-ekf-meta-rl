@@ -52,3 +52,13 @@ def log_and_save(results, name, output_dir):
     with open(path, "w") as f:
         json.dump(results, f, indent=2, default=float)
     return path
+
+
+# ================================================================
+# EKF
+# ================================================================
+
+class EKF6D:
+    def __init__(self, dt=0.1):
+        # 
+        pass
