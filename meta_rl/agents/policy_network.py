@@ -97,3 +97,39 @@ class GaussianPolicy(nn.Module):
         y = torch.sigmoid(mean)
         return self.action_low + (self.action_high - self.action_low) * y
 
+
+class QNetwork(nn.Module):
+    """Q-value network for SAC critic.
+
+    Args:
+        state_dim: Observation dimension.
+        context_dim: Latent context dimension.
+        action_dim: Action dimension.
+        hidden_dim: Hidden layer size.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        context_dim: int,
+        action_dim: int,
+        hidden_dim: int = 256,
+    ):
+        super().__init__()
+        input_dim = state_dim + context_dim + action_dim
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        state: torch.Tensor,
+        action: torch.Tensor,
+        context: torch.Tensor,
+    ) -> torch.Tensor:
+        x = torch.cat([state, action, context], dim=-1)
+        return self.net(x)
