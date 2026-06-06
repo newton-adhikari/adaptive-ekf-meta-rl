@@ -58,3 +58,18 @@ class FilterStateEncoder(nn.Module):
             tokens: (B, 1, embed_dim) — single query token.
         """
         return self.fc(filter_state).unsqueeze(1)
+
+
+class STSIEEncoder(nn.Module):
+    """Short-Time Spectral Innovation Encoder.
+
+    Two loop design:
+      - Slow loop: recompute context z every K EKF steps.
+      - Fast loop: policy uses cached z at every EKF step.
+    """
+
+    def __init__(
+        self
+    ):
+        super().__init__()
+        
