@@ -138,6 +138,87 @@ class PIDCCPOAgent:
     """
 
     def __init__(
-        self
+        self,
+        state_dim: int,
+        action_dim: int,
+        innovation_dim: int = 2,
+        filter_state_dim: int = 5,
+        config: Optional[dict] = None,
     ):
-        
+        config = config or {}
+        self.device = config.get("device", "cpu")
+        self.gamma = config.get("gamma", 0.95)
+        self.tau = config.get("tau", 0.005)
+        self.batch_size = config.get("batch_size", 256)
+        self.reward_scale = config.get("reward_scale", 0.01)
+
+        latent_dim = config.get("latent_dim", 32)
+        hidden_dim = config.get("hidden_dim", 256)
+        lr = config.get("lr", 3e-4)
+
+        # Running normalizers for stable training
+        self.obs_normalizer = RunningNormalizer(shape=(state_dim,))
+        self.reward_normalizer = RunningNormalizer(shape=(1,))
+
+        # Encoder (ST-SIE or raw GRU for ablation)
+        encoder_type = config.get("encoder_type", "st_sie")
+        if encoder_type == "st_sie":
+            self.encoder = STSIEEncoder(
+                innovation_dim=innovation_dim,
+                filter_state_dim=filter_state_dim,
+                latent_dim=latent_dim,
+                window_size=config.get("stft_window", 32),
+                hop_size=config.get("stft_hop", 8),
+            ).to(self.device)
+        else:
+            self.encoder = RawInnovationEncoder(
+                innovation_dim=innovation_dim,
+                filter_state_dim=filter_state_dim,
+                latent_dim=latent_dim,
+            ).to(self.device)
+
+        # Policy
+        self.policy = GaussianPolicy(
+            state_dim=state_dim,
+            context_dim=latent_dim,
+            action_dim=action_dim,
+            hidden_dim=hidden_dim,
+        ).to(self.device)
+
+        # Twin Q-networks
+        self.q1 = QNetwork(state_dim, latent_dim, action_dim, hidden_dim).to(self.device)
+        self.q2 = QNetwork(state_dim, latent_dim, action_dim, hidden_dim).to(self.device)
+        self.q1_target = deepcopy(self.q1)
+        self.q2_target = deepcopy(self.q2)
+
+        # Cost critic
+        self.cost_critic = QNetwork(
+            state_dim, latent_dim, action_dim, hidden_dim
+        ).to(self.device)
+        self.cost_critic_target = deepcopy(self.cost_critic)
+
+        # SAC entropy coefficient (auto-tuned)
+        self.target_entropy = -action_dim
+        self.log_alpha = torch.tensor(
+            np.log(0.2), dtype=torch.float32, requires_grad=True, device=self.device
+        )
+
+        # PID-Lagrangian with integral clamping
+        self.pid = PIDLagrangian(
+            delta=config.get("delta", 0.1),
+            k_p=config.get("pid_kp", 0.1),
+            k_i=config.get("pid_ki", 0.01),
+            k_d=config.get("pid_kd", 0.01),
+            integral_max=config.get("pid_integral_max", 10.0),
+        )
+
+        # Optimizers
+        self.encoder_optimizer = torch.optim.Adam(self.encoder.parameters(), lr=lr)
+        self.policy_optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
+        self.q_optimizer = torch.optim.Adam(
+            list(self.q1.parameters()) + list(self.q2.parameters()), lr=lr
+        )
+        self.cost_optimizer = torch.optim.Adam(self.cost_critic.parameters(), lr=lr)
+        self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=lr)
+
+        self._update_step = 0
