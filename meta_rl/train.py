@@ -14,6 +14,7 @@ import torch
 import warnings
 from pathlib import Path
 
+warnings.filterwarnings("ignore", message=".*NNPACK.*")
 
 from meta_rl.envs.lightweight_ekf_env import LightweightEKFEnv
 from meta_rl.agents.pid_ccpo_agent import PIDCCPOAgent
