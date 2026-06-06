@@ -127,3 +127,17 @@ class PIDLagrangian:
         self._lambda = 0.0
         self._integral = 0.0
         self._prev_error = 0.0
+
+
+
+class PIDCCPOAgent:
+    """
+    This is the CC-MetaEKF agent: 
+        SAC + PID-Lagrangian consistency constraint.
+    
+    """
+
+    def __init__(
+        self
+    ):
+        
