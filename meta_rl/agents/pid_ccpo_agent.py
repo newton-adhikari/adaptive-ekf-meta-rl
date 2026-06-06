@@ -75,3 +75,55 @@ class RunningNormalizer:
         self.var = state["var"].copy()
         self.count = state["count"]
 
+
+class PIDLagrangian:
+    """This is PID controller for the Lagrangian dual variable λ.
+
+    Updates λ based on constraint violation error using PID control,
+    which is more stable than vanilla gradient-based dual updates.
+    """
+
+    def __init__(
+        self,
+        delta: float = 0.1,
+        k_p: float = 0.1,
+        k_i: float = 0.01,
+        k_d: float = 0.01,
+        integral_max: float = 10.0,
+    ):
+        self.delta = delta
+        self.k_p = k_p
+        self.k_i = k_i
+        self.k_d = k_d
+        self.integral_max = integral_max
+
+        self._lambda = 0.0
+        self._integral = 0.0
+        self._prev_error = 0.0
+
+    def update(self, avg_violation: float) -> float:
+        """
+        this updates λ based on current average constraint violation.
+        """
+        error = avg_violation - self.delta
+        self._integral += error
+        # Clamp integral to prevent windup
+        self._integral = max(-self.integral_max, min(self.integral_max, self._integral))
+
+        derivative = error - self._prev_error
+        self._prev_error = error
+
+        self._lambda = max(
+            0.0,
+            self.k_p * error + self.k_i * self._integral + self.k_d * derivative,
+        )
+        return self._lambda
+
+    @property
+    def value(self) -> float:
+        return self._lambda
+
+    def reset(self):
+        self._lambda = 0.0
+        self._integral = 0.0
+        self._prev_error = 0.0
