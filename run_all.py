@@ -1,0 +1,1836 @@
+#!/usr/bin/env python3
+"""
+CC-MetaEKF: One-command training pipeline.
+
+runs all experiments, saves results + logs.
+
+"""
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.distributions import Normal
+import time, argparse, json, os, sys, warnings, logging
+from pathlib import Path
+from datetime import datetime
+
+warnings.filterwarnings("ignore")
+
+
+# ================================================================
+# Setup
+# ================================================================
+
+def setup_device():
+    if torch.cuda.is_available():
+        dev = "cuda"
+        name = torch.cuda.get_device_name()
+        torch.backends.cudnn.benchmark = True
+    else:
+        dev = "cpu"
+        name = f"{os.cpu_count()} CPU cores"
+        torch.set_num_threads(os.cpu_count() or 1)
+    return dev, name
+
+DEVICE, DEVICE_NAME = setup_device()
+
+def setup_logging(output_dir):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = output_dir / f"run_{ts}.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(log_file),
+        ],
+    )
+    return logging.getLogger("ccmetaekf"), log_file
+
+def log_and_save(results, name, output_dir):
+    path = output_dir / f"{name}.json"
+    with open(path, "w") as f:
+        json.dump(results, f, indent=2, default=float)
+    return path
+
+
+# ================================================================
+# Extended Kalman Filter (EKF)
+# ================================================================
+
+class EKF6D:
+    def __init__(self, dt=0.1):
+        # Setting filter dimensions:
+        # n = number of states
+        # m = number of measurements
+        self.n = 6
+        self.m = 2
+        self.dt = dt
+
+        # Storing lower and upper Chi-square bounds
+        # for checking filter consistency using NEES
+        self.chi2_lb = 1.237
+        self.chi2_ub = 14.449
+
+        # Initializing performance metrics
+        self.nees = 0.0
+        self.nis = 0.0
+
+        # Initializing innovation covariance matrix
+        self.S = np.eye(2)
+
+    def reset(self, x0, P0, Q, R):
+        # Loading initial state estimate
+        self.x = x0.copy().astype(np.float64)
+
+        # Loading initial covariance matrix
+        self.P = P0.copy().astype(np.float64)
+
+        # Storing process noise covariance
+        self.Q = Q.copy().astype(np.float64)
+
+        # Storing measurement noise covariance
+        self.R = R.copy().astype(np.float64)
+
+        # Resetting consistency metrics
+        self.nees = 0.0
+        self.nis = 0.0
+
+        # Resetting innovation covariance
+        self.S = np.eye(2)
+
+    def _F(self, x):
+        # Computing Jacobian matrix of the motion model
+        _, _, th, vx, vy, _ = x
+        dt = self.dt
+
+        F = np.eye(6)
+
+        # Calculating position sensitivity to heading
+        F[0,2] = (-vx*np.sin(th) - vy*np.cos(th)) * dt
+        F[0,3] = np.cos(th) * dt
+        F[0,4] = -np.sin(th) * dt
+
+        F[1,2] = (vx*np.cos(th) - vy*np.sin(th)) * dt
+        F[1,3] = np.sin(th) * dt
+        F[1,4] = np.cos(th) * dt
+
+        # Relating heading angle to angular velocity
+        F[2,5] = dt
+
+        return F
+
+    def _f(self, x, u):
+        # Predicting next state using the nonlinear motion model
+        px, py, th, vx, vy, om = x
+        dt = self.dt
+
+        return np.array([
+            px + vx*np.cos(th)*dt - vy*np.sin(th)*dt,  # Updating x position
+            py + vx*np.sin(th)*dt + vy*np.cos(th)*dt,  # Updating y position
+            th + om*dt,                                # Updating heading angle
+            vx + u[0]*dt,                              # Updating x velocity
+            vy + u[1]*dt,                              # Updating y velocity
+            om + u[2]*dt                               # Updating angular velocity
+        ])
+
+    def predict(self, u):
+        # Computing Jacobian at current state
+        F = self._F(self.x)
+
+        # Predicting next state estimate
+        self.x = self._f(self.x, u)
+
+        # Predicting covariance growth
+        self.P = F @ self.P @ F.T + self.Q
+
+        # Keeping covariance symmetric
+        self.P = (self.P + self.P.T) / 2
+
+    def update(self, z):
+        # Creating measurement matrix
+        # Measuring only x and y positions
+        H = np.zeros((2,6))
+        H[0,0] = 1
+        H[1,1] = 1
+
+        # Computing innovation (measurement error)
+        nu = z - H @ self.x
+
+        # Computing innovation covariance
+        S = H @ self.P @ H.T + self.R
+
+        # Computing Kalman gain
+        K = self.P @ H.T @ np.linalg.inv(S)
+
+        # Updating state estimate
+        self.x = self.x + K @ nu
+
+        # Updating covariance using Joseph form
+        I_KH = np.eye(6) - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ self.R @ K.T
+
+        # Keeping covariance symmetric
+        self.P = (self.P + self.P.T) / 2
+
+        # Storing innovation covariance
+        self.S = S
+
+        # Calculating NIS for measurement consistency checking
+        self.nis = float(nu @ np.linalg.inv(S) @ nu)
+
+        return nu
+
+    def compute_nees(self, x_true):
+        # Computing estimation error
+        e = x_true - self.x
+
+        try:
+            # Calculating NEES for state consistency checking
+            self.nees = float(e @ np.linalg.inv(self.P) @ e)
+        except:
+            # Using large penalty value if covariance inversion fails
+            self.nees = 100.0
+
+        return self.nees
+
+    def is_consistent(self):
+        # Checking whether NEES lies inside expected bounds
+        return self.chi2_lb <= self.nees <= self.chi2_ub
+
+
+# ================================================================
+# 1D EKF Used During Phase 0
+# Tracking position and velocity in one dimension
+# ================================================================
+
+class EKF1D:
+    def __init__(self, dt=0.1):
+        self.dt = dt
+
+        # Defining constant velocity state transition model
+        self.F = np.array([
+            [1.0, dt],
+            [0.0, 1.0]
+        ])
+
+        # Defining measurement model
+        # Measuring position only
+        self.H = np.array([
+            [1.0, 0.0]
+        ])
+
+    def reset(self, x0, P0, Q, R):
+        # Loading initial state estimate
+        self.x = x0.copy().astype(np.float64)
+
+        # Loading initial covariance estimate
+        self.P = P0.copy().astype(np.float64)
+
+        # Storing process noise covariance
+        self.Q = Q.copy().astype(np.float64)
+
+        # Storing measurement noise covariance
+        self.R = R.copy().astype(np.float64)
+
+    def predict(self):
+        # Predicting next state
+        self.x = self.F @ self.x
+
+        # Predicting covariance growth
+        self.P = self.F @ self.P @ self.F.T + self.Q
+
+        # Keeping covariance symmetric
+        self.P = (self.P + self.P.T) / 2
+
+    def update(self, z):
+        # Computing measurement residual
+        nu = z - self.H @ self.x
+
+        # Computing residual covariance
+        S = self.H @ self.P @ self.H.T + self.R
+
+        # Computing Kalman gain
+        K = (self.P @ self.H.T) / S[0,0]
+
+        # Updating state estimate
+        self.x = self.x + K[:,0] * nu[0]
+
+        # Updating covariance using Joseph form
+        I_KH = np.eye(2) - K @ self.H.reshape(1,2)
+        self.P = I_KH @ self.P @ I_KH.T + K @ self.R @ K.T
+
+        # Keeping covariance symmetric
+        self.P = (self.P + self.P.T) / 2
+
+        return nu[0], S[0,0]
+
+    def nees(self, x_true):
+        # Computing estimation error
+        e = x_true - self.x
+
+        try:
+            # Calculating NEES for filter consistency evaluation
+            return float(e @ np.linalg.inv(self.P) @ e)
+        except:
+            # Returning large value if inversion fails
+            return 100.0
+        
+
+# ================================================================
+# Tasks and Environments
+# ================================================================
+
+class Task:
+    def __init__(self, Q_diag, R_diag, regime="stationary", ct=50):
+
+        # Stored baseline process and measurement noise
+        self.Q_base = np.array(Q_diag)
+        self.R_base = np.array(R_diag)
+
+        # Remembered what kind of chaos this task wanted
+        self.regime = regime
+        self.change_time = ct
+
+        # Generated future noise values for abrupt changes
+        # Basically preparing a surprise attack for the EKF
+        self.Q_after = self.Q_base * np.random.choice([0.2, 5.0], size=len(Q_diag))
+        self.R_after = self.R_base * np.random.choice([0.2, 5.0], size=len(R_diag))
+
+    def get_noise(self, t):
+
+        # Keeping life easy: noise never changed
+        if self.regime == "stationary":
+            return np.diag(self.Q_base), np.diag(self.R_base)
+
+        # Noise suddenly woke up and chose violence
+        elif self.regime == "abrupt" and t >= self.change_time:
+            return np.diag(self.Q_after), np.diag(self.R_after)
+
+        # Slowly increasing uncertainty over time
+        elif self.regime == "drift":
+            s = 1 + 0.005 * t
+            return np.diag(self.Q_base * s), np.diag(self.R_base * s)
+
+        # Falling back to default noise values
+        return np.diag(self.Q_base), np.diag(self.R_base)
+
+
+def sample_task(rng):
+
+    # Sampled process noise from a log-uniform distribution
+    q = np.exp(rng.uniform(np.log(0.005), np.log(0.2), 6))
+
+    # Sampled measurement noise
+    r = np.exp(rng.uniform(np.log(0.05), np.log(2.0), 2))
+
+    # Randomly picked a world behavior
+    regime = rng.choice(
+        ["stationary", "abrupt", "drift"],
+        p=[0.5, 0.3, 0.2]
+    )
+
+    # Created a fresh task for the agent to suffer through
+    return Task(q, r, regime, rng.integers(30, 70))
+
+
+class Env6D:
+
+    def __init__(self, ep_len=100):
+
+        # Stored episode length
+        self.ep_len = ep_len
+
+        # Created EKF instance
+        self.ekf = EKF6D()
+
+        # Set nominal covariance values
+        self.Q_nom = np.eye(6) * 0.05
+        self.R_nom = np.eye(2) * 0.5
+
+        # Keeping recent innovation history
+        self.ctx_len = 30
+
+        # Number of innovations exposed to the policy
+        self.n_innov = 5
+
+        # Observation vector size
+        self.obs_dim = self.n_innov*2 + 1 + 1 + 1 + 6 + 6 + 2
+
+        # Action controls 6 Q values + 2 R values
+        self.act_dim = 8
+
+        # Created RNG for generating random nonsense responsibly
+        self.rng = np.random.default_rng()
+
+    def reset(self, task=None):
+
+        # Generated a new task if none was supplied
+        self.task = task or sample_task(self.rng)
+
+        # Reset episode clock
+        self.t = 0
+
+        # Chose a trajectory type
+        traj = self.rng.choice(["circle", "straight", "random"])
+        self.traj_type = traj
+
+        # Started with zero state
+        self.x_true = np.zeros(6)
+
+        # Spawned circular motion
+        if traj == "circle":
+            self.x_true = np.array([2, 0, np.pi/2, 0, 1.0, 0.5])
+
+        # Spawned boring but predictable straight motion
+        elif traj == "straight":
+            self.x_true = np.array([0, 0, 0, 1, 0, 0])
+
+        # Added initialization error because perfect sensors only exist in slides
+        x0 = self.x_true + self.rng.normal(0, 0.2, 6)
+
+        # Reset EKF state
+        self.ekf.reset(
+            x0,
+            np.eye(6) * 0.5,
+            self.Q_nom.copy(),
+            self.R_nom.copy()
+        )
+
+        # Started innovation history
+        self.innovs = [[0.0, 0.0]] * self.ctx_len
+
+        # Started NEES history tracking
+        self.nees_history = []
+
+        return self._obs(), self._ctx()
+
+    def step(self, action):
+
+        # Converted actions into positive scaling factors
+        alphas = np.clip(np.exp(action), 0.01, 100.0)
+
+        # Updated EKF covariance guesses
+        self.ekf.Q = np.diag(alphas[:6]) @ self.Q_nom
+        self.ekf.R = np.diag(alphas[6:]) @ self.R_nom
+
+        # Retrieved actual environment noise
+        Q_true, R_true = self.task.get_noise(self.t)
+
+        # Started with zero control input
+        u = np.zeros(3)
+
+        # Generated random controls for the random trajectory
+        if self.traj_type == "random":
+            u = self.rng.normal(0, 0.3, 3)
+
+        # Propagated true state using real noise
+        self.x_true = (
+            self.ekf._f(self.x_true, u)
+            + self.rng.multivariate_normal(np.zeros(6), Q_true)
+        )
+
+        # Generated noisy position measurement
+        z = (
+            self.x_true[:2]
+            + self.rng.multivariate_normal(np.zeros(2), R_true)
+        )
+
+        # Running EKF predict-update cycle
+        self.ekf.predict(u)
+        nu = self.ekf.update(z)
+
+        # Calculated consistency score
+        nees = self.ekf.compute_nees(self.x_true)
+
+        # Stored latest innovation
+        self.innovs.append(nu.tolist())
+
+        # Keeping only recent history
+        self.innovs = self.innovs[-self.ctx_len:]
+
+        self.t += 1
+
+        # Checking whether episode finished
+        done = self.t >= self.ep_len
+
+        # Tracking NEES history for smoother rewards
+        self.nees_history.append(nees)
+
+        # Averaging recent consistency values
+        avg_nees = np.mean(self.nees_history[-20:])
+
+        # Measuring state estimation error
+        rmse = float(
+            np.sqrt(np.mean((self.x_true - self.ekf.x) ** 2))
+        )
+
+        # Rewarding NEES staying near target value
+        # Less drama = more reward
+        reward = -np.log1p(abs(avg_nees - 6))
+
+        # Punishing large estimation errors
+        reward -= 0.05 * min(rmse, 10.0)
+
+        # EKF behaving itself earned bonus points
+        if self.ekf.is_consistent():
+            reward += 0.3
+
+        # Running average staying in healthy range
+        if 3.0 <= avg_nees <= 12.0:
+            reward += 0.3
+
+        return (
+            self._obs(),
+            self._ctx(),
+            reward,
+            done,
+            {
+                "nees": nees,
+                "rmse": rmse,
+                "consistent": self.ekf.is_consistent()
+            }
+        )
+
+    def _obs(self):
+
+        # Flattening recent innovations into one vector
+        iv = np.array(
+            self.innovs[-self.n_innov:]
+        ).flatten()
+
+        # Building observation features for the policy
+        # Compressing huge values before they start causing drama
+        return np.clip(
+            np.concatenate([
+                iv,
+
+                # Normalized consistency metrics
+                [self.ekf.nees / 6,
+                 self.ekf.nis / 2],
+
+                # Tracking covariance growth
+                [np.log1p(max(np.trace(self.ekf.P), 0))],
+
+                # State uncertainty
+                np.log1p(np.maximum(np.diag(self.ekf.P), 0)),
+
+                # Process noise estimate
+                np.log1p(np.maximum(np.diag(self.ekf.Q), 0)),
+
+                # Measurement noise estimate
+                np.log1p(np.maximum(np.diag(self.ekf.R), 0))
+            ]),
+            -20,
+            20
+        ).astype(np.float32)
+
+    def _ctx(self):
+
+        # Returning full innovation history
+        # Agent memory, because forgetting is bad
+        return np.array(
+            self.innovs,
+            dtype=np.float32
+        ).flatten()
+
+
+# ================================================================
+# Networks
+# ================================================================
+
+class STSIEEncoder(nn.Module):
+    def __init__(self, innov_dim=2, filter_dim=4, latent=32, window=16, hop=4):
+        super().__init__(); self.window=window; self.hop=hop; ch=16
+
+        # making cnn layers for taking spectral features
+        self.cnn=nn.Sequential(nn.Conv2d(innov_dim,ch,3,padding=1),nn.ReLU(),
+            nn.Conv2d(ch,ch*2,3,padding=1),nn.ReLU(),nn.AdaptiveAvgPool2d((4,4)))
+
+        # making projection for spectral embedding
+        self.embed=64; self.sp=nn.Linear(ch*2*16,self.embed)
+
+        # making filter statistic embedding
+        self.fe=nn.Sequential(nn.Linear(filter_dim,self.embed),nn.ReLU(),nn.Linear(self.embed,self.embed))
+
+        # using attention for joining spectral and filter info
+        self.ca=nn.MultiheadAttention(self.embed,4,batch_first=True)
+
+        # making final latent feature output
+        self.out=nn.Sequential(nn.Linear(self.embed+filter_dim,latent),nn.ReLU(),nn.Linear(latent,latent))
+
+        # storing hann window for fft processing
+        self.register_buffer("hann",torch.hann_window(window).float())
+
+    def _spec(self, buf):
+        B,L,D=buf.shape
+
+        # checking if buffer is smaller than window
+        if L < self.window:
+            # adding zero padding for matching window size
+            pad = torch.zeros(B, self.window - L, D, device=buf.device)
+            buf = torch.cat([pad, buf], dim=1)
+            L = self.window
+
+        # calculating number of frames
+        nf=max(1,(L-self.window)//self.hop+1)
+
+        # making overlapping frames from buffer
+        fr=torch.stack([buf[:,i*self.hop:i*self.hop+self.window] for i in range(nf)],1)
+
+        # applying hann window on frames
+        fr=fr*self.hann[None,None,:,None]
+
+        # reshaping for fft calculation
+        flat=fr.permute(0,1,3,2).reshape(-1,self.window)
+
+        # calculating power spectrum
+        fft=torch.fft.rfft(flat, dim=-1); pw=(fft.abs()**2)/self.window
+
+        # returning log power spectrum
+        return torch.log(pw.reshape(B,nf,D,self.window//2+1).permute(0,2,1,3)+1e-10)
+
+    def forward(self, ib, fs):
+
+        # extracting spectral features
+        s=self._spec(ib); f=self.cnn(s).flatten(1)
+
+        # making spectral token and filter token
+        st=self.sp(f).unsqueeze(1); q=self.fe(fs).unsqueeze(1)
+
+        # applying cross attention
+        a,_=self.ca(q,st,st)
+
+        # returning latent representation
+        return self.out(torch.cat([a.squeeze(1),fs],-1))
+
+class MLPEncoder(nn.Module):
+    def __init__(self, ctx_dim, filter_dim=4, latent=32):
+        super().__init__()
+
+        # making simple mlp encoder
+        self.net=nn.Sequential(nn.Linear(ctx_dim+filter_dim,128),nn.ReLU(),nn.Linear(128,64),nn.ReLU(),nn.Linear(64,latent))
+
+    def forward(self, ib, fs):
+
+        # joining inputs and making latent feature
+        return self.net(torch.cat([ib.flatten(1),fs],-1))
+
+class Policy(nn.Module):
+    def __init__(self, obs_dim, act_dim, encoder, hidden=256):
+        super().__init__(); self.encoder=encoder; latent=32; inp=obs_dim+latent
+
+        # making actor network for action generation
+        self.actor=nn.Sequential(nn.Linear(inp,hidden),nn.Tanh(),nn.Linear(hidden,hidden),nn.Tanh())
+
+        # making mean and std parameters
+        self.mean=nn.Linear(hidden,act_dim); self.log_std=nn.Parameter(torch.zeros(act_dim)-0.5)
+
+        # making reward critic network
+        self.critic=nn.Sequential(nn.Linear(inp,hidden),nn.Tanh(),nn.Linear(hidden,hidden),nn.Tanh(),nn.Linear(hidden,1))
+
+        # making cost critic network
+        self.cost_critic=nn.Sequential(nn.Linear(inp,hidden),nn.Tanh(),nn.Linear(hidden,hidden),nn.Tanh(),nn.Linear(hidden,1))
+
+    def forward(self, obs, ib, fs):
+
+        # encoding innovation and filter stats
+        z=self.encoder(ib,fs)
+
+        # joining observation and latent feature
+        x=torch.cat([obs,z],-1)
+
+        # making actor hidden feature
+        h=self.actor(x)
+
+        # returning action distribution and critics
+        return Normal(self.mean(h),self.log_std.exp().expand(obs.shape[0],-1)),self.critic(x),self.cost_critic(x)
+
+    def act(self, obs, ib, fs):
+        with torch.no_grad():
+
+            # getting policy outputs
+            d,v,cv=self.forward(obs,ib,fs)
+
+            # sampling action from distribution
+            a=d.sample()
+
+            # calculating action log probability
+            lp=d.log_prob(a).sum(-1)
+
+        # returning numpy values
+        return a.cpu().numpy(),lp.cpu().numpy(),v.cpu().numpy(),cv.cpu().numpy()
+
+class PIDLag:
+    def __init__(self,delta=0.15,kp=0.1,ki=0.008,kd=0.02,imax=5):
+
+        # storing pid parameters
+        self.delta=delta;self.kp=kp;self.ki=ki;self.kd=kd;self.imax=imax
+
+        # initializing lagrangian values
+        self.lam=0;self.integral=0;self.prev=0
+
+    def update(self,vr):
+
+        # calculating constraint error
+        e=vr-self.delta
+
+        # updating integral term
+        self.integral=np.clip(self.integral+e,-self.imax,self.imax)
+
+        # calculating derivative term
+        d=e-self.prev; self.prev=e
+
+        # updating lagrangian multiplier
+        self.lam=max(0,self.kp*e+self.ki*self.integral+self.kd*d)
+
+        return self.lam
+
+    def reset(self):
+
+        # resetting pid states
+        self.lam=0;self.integral=0;self.prev=0
+
+
+# ================================================================
+# PPO Core
+# ================================================================
+
+def compute_gae(rew,val,cost,cval,done,gamma=0.99,lam=0.95):
+
+    # creating advantage buffers
+    T=len(rew); adv=np.zeros(T); cadv=np.zeros(T); lg=0; clg=0
+
+    # going backward for gae calculation
+    for t in reversed(range(T)):
+
+        # getting next values
+        nv=val[t+1] if t+1<len(val) else 0; ncv=cval[t+1] if t+1<len(cval) else 0
+
+        # calculating reward advantage
+        d=rew[t]+gamma*nv*(1-done[t])-val[t]; adv[t]=lg=d+gamma*lam*(1-done[t])*lg
+
+        # calculating cost advantage
+        cd=cost[t]+gamma*ncv*(1-done[t])-cval[t]; cadv[t]=clg=cd+gamma*lam*(1-done[t])*clg
+
+    # returning returns and advantages
+    return adv+np.array(val[:T]),adv,cadv+np.array(cval[:T]),cadv
+
+def ppo_update(policy,opt,pid,ob,ib,fs,act,ret,adv,cret,cadv,logp,cost,
+               use_constraint=True,clip=0.2,epochs=6,bs=512,max_kl=0.02):
+
+    # getting batch size and device
+    N=ob.shape[0]; dev=DEVICE
+
+    # normalizing advantages
+    adv=(adv-adv.mean())/(adv.std()+1e-8)
+
+    # updating lagrangian multiplier
+    lam=pid.update(cost.mean()) if use_constraint else 0.0
+
+    # converting numpy arrays into tensors
+    ot=torch.tensor(ob,dtype=torch.float32,device=dev)
+    ibt=torch.tensor(ib,dtype=torch.float32,device=dev)
+    fst=torch.tensor(fs,dtype=torch.float32,device=dev)
+    at=torch.tensor(act,dtype=torch.float32,device=dev)
+    rt=torch.tensor(ret,dtype=torch.float32,device=dev)
+    adt=torch.tensor(adv,dtype=torch.float32,device=dev)
+    crt=torch.tensor(cret,dtype=torch.float32,device=dev)
+    cadt=torch.tensor(cadv,dtype=torch.float32,device=dev)
+    lpt=torch.tensor(logp,dtype=torch.float32,device=dev)
+
+    # running multiple ppo epochs
+    for ep in range(epochs):
+
+        # shuffling samples
+        idx=torch.randperm(N,device=dev); kls=0; nb=0
+
+        # making mini batches
+        for s in range(0,N,bs):
+
+            # selecting mini batch
+            mb=idx[s:s+bs]; dist,val,cval=policy(ot[mb],ibt[mb],fst[mb])
+
+            # calculating policy ratio
+            lp=dist.log_prob(at[mb]).sum(-1); ratio=(lp-lpt[mb]).exp()
+
+            # estimating kl divergence
+            with torch.no_grad(): kls+=abs(((ratio-1)-(lp-lpt[mb])).mean().item()); nb+=1
+
+            # calculating clipped surrogate objective
+            s1=ratio*adt[mb]; s2=torch.clamp(ratio,1-clip,1+clip)*adt[mb]
+
+            # calculating total ppo loss
+            loss=(-torch.min(s1,s2).mean()+0.5*(rt[mb]-val.squeeze()).pow(2).mean()
+                  +0.5*(crt[mb]-cval.squeeze()).pow(2).mean()-0.01*dist.entropy().sum(-1).mean())
+
+            # adding constraint penalty
+            if use_constraint: loss+=lam*(ratio*cadt[mb]).mean()
+
+            # doing gradient updating
+            opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(policy.parameters(),0.5); opt.step()
+
+        # stopping early if kl is large
+        if nb>0 and kls/nb>max_kl: break
+
+    # returning training statistics
+    return {"pi":loss.item(),"lam":lam,"viol":float(cost.mean())}
+
+def collect(env,policy,n_steps,action_clip=5.0):
+
+    # making rollout storage lists
+    ol,il,fl,al,rl,cl,dl,ll,vl,cvl=[],[],[],[],[],[],[],[],[],[]
+
+    # resetting environment
+    obs,ctx=env.reset()
+
+    # collecting rollout samples
+    for _ in range(n_steps):
+
+        # getting innovation buffer
+        ib=np.array(env.innovs,dtype=np.float32)
+
+        # getting filter statistics
+        fs=np.array([env.ekf.nees/6,env.ekf.nis/2,np.log1p(np.trace(env.ekf.P)),np.log1p(env.ekf.S[0,0])],dtype=np.float32)
+
+        # converting inputs into tensors
+        ot=torch.tensor(obs,dtype=torch.float32,device=DEVICE).unsqueeze(0)
+        ibt=torch.tensor(ib,dtype=torch.float32,device=DEVICE).unsqueeze(0)
+        fst=torch.tensor(fs,dtype=torch.float32,device=DEVICE).unsqueeze(0)
+
+        # sampling action from policy
+        a,lp,v,cv=policy.act(ot,ibt,fst); a=a.squeeze();lp=lp.squeeze();v=v.squeeze();cv=cv.squeeze()
+
+        # stepping environment with clipped action
+        nobs,nctx,rew,done,info=env.step(np.clip(a,-action_clip,action_clip))
+
+        # storing rollout data
+        ol.append(obs);il.append(ib);fl.append(fs);al.append(a);rl.append(rew)
+
+        # storing cost and value info
+        cl.append(0.0 if info["consistent"] else 1.0);dl.append(float(done));ll.append(lp);vl.append(v);cvl.append(cv)
+
+        # resetting or moving next state
+        obs,ctx=(env.reset() if done else (nobs,nctx))
+
+    # returning collected rollout arrays
+    return tuple(np.array(x) for x in [ol,il,fl,al,rl,cl,dl,ll,vl,cvl])
+
+def evaluate(env,policy,tasks,n_ep=5):
+
+    # storing evaluation results
+    results=[]
+
+    # running all evaluation tasks
+    for task in tasks:
+        for _ in range(n_ep):
+
+            # resetting environment with task
+            obs,ctx=env.reset(task=task); nl=[]; done=False
+
+            # running episode
+            while not done:
+
+                # getting innovation buffer
+                ib=np.array(env.innovs,dtype=np.float32)
+
+                # getting filter statistics
+                fs=np.array([env.ekf.nees/6,env.ekf.nis/2,np.log1p(np.trace(env.ekf.P)),np.log1p(env.ekf.S[0,0])],dtype=np.float32)
+
+                # converting inputs into tensors
+                ot=torch.tensor(obs,dtype=torch.float32,device=DEVICE).unsqueeze(0)
+                ibt=torch.tensor(ib,dtype=torch.float32,device=DEVICE).unsqueeze(0)
+                fst=torch.tensor(fs,dtype=torch.float32,device=DEVICE).unsqueeze(0)
+
+                # taking mean action for evaluation
+                with torch.no_grad(): d,_,_=policy(ot,ibt,fst); a=d.mean.squeeze().cpu().numpy()
+
+                # stepping environment
+                obs,ctx,_,done,info=env.step(np.clip(a,-5,5))
+
+                # storing nees values
+                nl.append(info["nees"])
+
+            # calculating episode metrics
+            na=np.array(nl); results.append({"nees":np.mean(na),"cons":float(np.mean((na>=1.237)&(na<=14.449))),"rmse":np.mean([info["rmse"]])})
+
+    # returning averaged evaluation metrics
+    return (np.mean([r["nees"] for r in results]),np.mean([r["cons"] for r in results]),
+            np.mean([r["rmse"] for r in results]))
+
+
+# ================================================================
+# Training function (used by all phases)
+# ================================================================
+
+def train_6d(encoder_type, use_constraint, label, seed, epochs, steps_per_epoch,
+             output_dir, log):
+
+    # setting random seeds for reproducible training
+    np.random.seed(seed); torch.manual_seed(seed)
+
+    # creating environment and random generator
+    env=Env6D(ep_len=100); rng=np.random.default_rng(seed)
+
+    # generating training tasks
+    train_tasks=[sample_task(rng) for _ in range(30)]
+
+    # generating testing tasks
+    test_tasks=[sample_task(rng) for _ in range(15)]
+
+    # selecting encoder based on experiment type
+    if encoder_type=="stsie":
+
+        # using spectral-temporal encoder
+        enc=STSIEEncoder(2,4,32,16,4)
+    else:
+
+        # using simple mlp encoder
+        enc=MLPEncoder(env.ctx_len*2,4,32)
+
+    # creating policy network
+    policy=Policy(env.obs_dim,env.act_dim,enc).to(DEVICE)
+
+    # setting initial learning rate
+    lr0=3e-4
+
+    # creating optimizer
+    opt=torch.optim.Adam(policy.parameters(),lr=lr0)
+
+    # creating pid lagrangian controller
+    pid=PIDLag()
+
+    # storing best consistency score
+    pid=PIDLag(); best_cons=0; no_imp=0
+
+    # making checkpoint file path
+    ckpt=output_dir/f"best_{encoder_type}_{'pid' if use_constraint else 'none'}_s{seed}.pt"
+
+    # printing training header
+    log.info(f"\n{'='*65}")
+    log.info(f"Training: {label} | seed={seed} | {DEVICE_NAME}")
+    log.info(f"{'='*65}")
+
+    # running baseline evaluation with untrained mlp policy
+    bn,bc,br=evaluate(env,Policy(env.obs_dim,env.act_dim,
+        MLPEncoder(env.ctx_len*2,4,32)).to(DEVICE),test_tasks[:5],3)
+
+    # logging baseline results
+    log.info(f"Baseline: NEES={bn:.1f} Cons={bc:.1%} RMSE={br:.3f}")
+
+    # creating history storage
+    history=[]
+
+    # starting training epochs
+    for ep in range(1,epochs+1):
+
+        # starting epoch timer
+        t0=time.time()
+
+        # calculating learning rate decay fraction
+        frac=1-(ep-1)/epochs
+
+        # updating learning rate
+        for pg in opt.param_groups: pg['lr']=lr0*max(frac,0.02)
+
+        # updating ppo clip value
+        clip_now=0.2*max(frac,0.1)
+
+        # changing environment randomness each epoch
+        env.rng=np.random.default_rng(seed+ep)
+
+        # using smaller action range during warmup for avoiding divergence
+        act_clip = 2.0 if ep <= 200 else 5.0
+
+        # collecting rollout samples
+        ob,ib,fs,ab,rb,cb,db,lpb,vb,cvb=collect(env,policy,steps_per_epoch,action_clip=act_clip)
+
+        # calculating returns and advantages
+        ret,adv,cret,cadv=compute_gae(rb,vb,cb,cvb,db)
+
+        # updating policy using ppo
+        losses=ppo_update(policy,opt,pid,ob,ib,fs,ab,ret,adv,cret,cadv,lpb,cb,
+                          use_constraint=use_constraint,clip=clip_now)
+
+        # calculating epoch runtime
+        elapsed=time.time()-t0
+
+        # the great, training progress
+        if ep%10==0 or ep<=3:
+            log.info(f"  Ep {ep:4d}/{epochs} | pi={losses['pi']:.3f} lam={losses['lam']:.3f} "
+                     f"viol={losses['viol']:.3f} | {elapsed:.1f}s")
+
+        # running evaluation every 50 epochs
+        if ep%50==0:
+
+            # evaluating on training tasks
+            tn,tc,tr=evaluate(env,policy,train_tasks[:10],5)
+
+            # evaluating on testing tasks
+            en,ec,er=evaluate(env,policy,test_tasks[:10],5)
+
+            # preparing best model marker
+            tag=""
+
+            # checking for improvement in consistency
+            if ec>best_cons:
+
+                # saving best model checkpoint
+                best_cons=ec; no_imp=0; torch.save(policy.state_dict(),str(ckpt)); tag=" *"
+            else:
+
+                # counting epochs without improvement
+                no_imp+=50
+
+            # logging evaluation results
+            log.info(f"    [Eval] Train: NEES={tn:.1f} Cons={tc:.1%} | "
+                     f"Test: NEES={en:.1f} Cons={ec:.1%} RMSE={er:.3f}{tag}")
+
+            # storing evaluation history
+            history.append({"ep":ep,"train_nees":tn,"train_cons":tc,"test_nees":en,"test_cons":ec,"test_rmse":er})
+
+    # running final evaluation on all training tasks
+    fn,fc,fr=evaluate(env,policy,train_tasks,5)
+
+    # running final evaluation on all testing tasks
+    en,ec,er=evaluate(env,policy,test_tasks,5)
+
+    # logging final results
+    log.info(f"\nFinal: Train NEES={fn:.1f} Cons={fc:.1%} | Test NEES={en:.1f} Cons={ec:.1%} RMSE={er:.3f}")
+
+    # logging best consistency achieved
+    log.info(f"Best test consistency: {best_cons:.1%}")
+
+    # collecting all experiment results
+    result={"label":label,"encoder":encoder_type,"constraint":use_constraint,"seed":seed,
+            "baseline":{"nees":bn,"cons":bc,"rmse":br},
+            "train":{"nees":fn,"cons":fc,"rmse":fr},"test":{"nees":en,"cons":ec,"rmse":er},
+            "best_cons":best_cons,"history":history}
+
+    # returning final result dictionary
+    return result
+
+
+# ================================================================
+# Phase 0: 1D Feasibility Check
+# (Sanity check before scaling up to full EKF world)
+# ================================================================
+
+def run_phase0(seed, output_dir, log):
+    # entering the simplest sanity-check phase
+    log.info(f"\n{'='*65}\nPhase 0: 1D EKF Feasibility\n{'='*65}")
+
+    # fixing randomness so results don't randomly drift every run
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    # ------------------------------------------------------------
+    # tiny PPO model just for the 1D toy problem
+    # ------------------------------------------------------------
+    class PPO1D(nn.Module):
+
+        def __init__(self, od, ad, h=128):
+            super().__init__()
+
+            # compress observation into something useful
+            self.actor = nn.Sequential(
+                nn.Linear(od, h),
+                nn.Tanh(),
+                nn.Linear(h, h),
+                nn.Tanh()
+            )
+
+            # producing mean action + learned exploration scale
+            self.mean = nn.Linear(h, ad)
+            self.log_std = nn.Parameter(torch.zeros(ad) - 0.5)
+
+            # critic estimates value of current state
+            self.critic = nn.Sequential(
+                nn.Linear(od, h),
+                nn.Tanh(),
+                nn.Linear(h, h),
+                nn.Tanh(),
+                nn.Linear(h, 1),
+            )
+
+        def forward(self, o):
+            # run observation through network and return policy + value
+            h = self.actor(o)
+            dist = Normal(
+                self.mean(h),
+                self.log_std.exp().expand(o.shape[0], -1)
+            )
+            val = self.critic(o)
+            return dist, val
+
+        def act(self, o):
+            # sampling actions without tracking gradients (pure rollout mode)
+            with torch.no_grad():
+                dist, v = self.forward(o)
+                a = dist.sample()
+                lp = dist.log_prob(a).sum(-1)
+
+            # convert everything back to numpy for environment use
+            return a.numpy(), lp.numpy(), v.numpy()
+
+    # true system vs mismatched filter assumptions
+    Q_true = np.diag([0.01, 0.01])
+    R_true = np.array([[1.0]])
+
+    Q_nom = np.diag([1.0, 1.0])
+    R_nom = np.array([[0.01]])
+
+    # helper: run one full 1D EKF episode
+    def run_1d_ep(ekf, alpha_Q, alpha_R, ep_len=100):
+
+        # true state starts simple but slightly noisy
+        x_true = np.array([0.0, 1.0])
+
+        # filter starts with uncertainty in initial guess
+        x0 = x_true + np.random.randn(2) * 0.3
+        ekf.reset(x0, np.eye(2), Q_nom.copy(), R_nom.copy())
+
+        nees_log = []
+
+        for _ in range(ep_len):
+
+            # tuning EKF noise assumptions (this is what we will learn later)
+            ekf.Q = Q_nom * alpha_Q
+            ekf.R = R_nom * alpha_R
+
+            # propagate true system with process noise
+            x_true = ekf.F @ x_true + np.random.multivariate_normal([0, 0], Q_true)
+
+            # noisy measurement of position only
+            z = (ekf.H @ x_true) + np.array([np.random.normal(0, 1.0)])
+
+            # EKF predict-update cycle
+            ekf.predict()
+            ekf.update(z)
+
+            # consistency check metric
+            nees_log.append(ekf.nees(x_true))
+
+        # summarizing episode performance
+        na = np.array(nees_log)
+
+        return np.mean(na), float(np.mean((na >= 0.051) & (na <= 7.378)))
+
+    # baseline EKF evaluation (bad assumptions on purpose)
+    ekf = EKF1D()
+
+    bl_n, bl_c = np.mean(
+        [run_1d_ep(ekf, 1, 1) for _ in range(50)],
+        axis=0
+    )
+
+    log.info(f"Baseline (wrong Q/R): NEES={bl_n:.2f} Cons={bl_c:.1%}")
+
+    # pretending we know correct noise
+    or_n, or_c = np.mean(
+        [run_1d_ep(ekf, 0.01, 100) for _ in range(50)],
+        axis=0
+    )
+
+    log.info(f"Oracle (true Q/R):    NEES={or_n:.2f} Cons={or_c:.1%}")
+
+    # learning policy that tunes Q/R scaling online
+    policy = PPO1D(13, 2)
+    opt = torch.optim.Adam(policy.parameters(), lr=3e-4)
+
+    best_c = 0
+
+    # ------------------------------------------------------------
+    # main training loop
+    # ------------------------------------------------------------
+    for it in range(1, 1001):
+
+        # storage for rollout
+        obs_buf, act_buf, rew_buf, done_buf, lp_buf, val_buf = [], [], [], [], [], []
+
+        # reset simulation
+        x_true = np.array([0.0, 1.0])
+        ekf.reset(
+            x_true + np.random.randn(2) * 0.3,
+            np.eye(2),
+            Q_nom.copy(),
+            R_nom.copy()
+        )
+
+        innovs = [0.0] * 5
+        last_nees = 0
+        step = 0
+
+        # --------------------------------------------------------
+        # collect trajectory
+        # --------------------------------------------------------
+        for _ in range(800):
+
+            # building observation vector (innovation + EKF stats)
+            obs = np.concatenate([
+                innovs,
+                [
+                    last_nees / 5,
+                    np.log1p(np.trace(ekf.P)),
+                    0, 0, 0, 0, 0, 0
+                ]
+            ]).astype(np.float32)[:13]
+
+            ot = torch.tensor(obs).unsqueeze(0)
+
+            # policy decision
+            a, lp, v = policy.act(ot)
+            a = a.squeeze()
+            lp = lp.squeeze()
+            v = v.squeeze()
+
+            # converting policy output into noise scaling factors
+            alpha = np.clip(np.exp(a), 0.01, 100)
+
+            # injecting adaptation into EKF
+            ekf.Q = Q_nom * alpha[0]
+            ekf.R = R_nom * alpha[1]
+
+            # system evolution
+            x_true = ekf.F @ x_true + np.random.multivariate_normal([0, 0], Q_true)
+            z = (ekf.H @ x_true) + np.array([np.random.normal(0, 1)])
+
+            # EKF update
+            ekf.predict()
+            nu, S = ekf.update(z)
+
+            nees = ekf.nees(x_true)
+
+            # update short-term memory
+            innovs.append(nu)
+            innovs = innovs[-5:]
+            last_nees = nees
+
+            # reward shaped around consistency + tracking error
+            reward = -np.log1p(abs(nees - 2)) \
+                     - 0.1 * min(float(np.sqrt(np.mean((x_true - ekf.x) ** 2))), 10)
+
+            # bonus if EKF stays statistically consistent
+            if 0.051 <= nees <= 7.378:
+                reward += 0.5
+
+            step += 1
+            done = step % 100 == 0
+
+            # storing transition
+            obs_buf.append(obs)
+            act_buf.append(a)
+            rew_buf.append(reward)
+            done_buf.append(float(done))
+            lp_buf.append(lp)
+            val_buf.append(v)
+
+            # reset sub-episode
+            if done:
+                x_true = np.array([0.0, 1.0])
+                ekf.reset(
+                    x_true + np.random.randn(2) * 0.3,
+                    np.eye(2),
+                    Q_nom.copy(),
+                    R_nom.copy()
+                )
+                innovs = [0.0] * 5
+                last_nees = 0
+                step = 0
+
+        # advantage estimation (GAE-style)
+        T = len(rew_buf)
+        adv = np.zeros(T)
+        lg = 0
+
+        for t in reversed(range(T)):
+            nv = val_buf[t + 1] if t + 1 < T else 0
+            delta = rew_buf[t] + 0.99 * nv * (1 - done_buf[t]) - val_buf[t]
+            adv[t] = lg = delta + 0.99 * 0.95 * (1 - done_buf[t]) * lg
+
+        ret = adv + np.array(val_buf)
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+        # PPO update
+        for _ in range(6):
+            idx = np.random.permutation(T)
+
+            for s in range(0, T, 128):
+                mb = idx[s:s + 128]
+
+                o = torch.tensor(np.array(obs_buf)[mb], dtype=torch.float32)
+                ac = torch.tensor(np.array(act_buf)[mb], dtype=torch.float32)
+                r = torch.tensor(ret[mb], dtype=torch.float32)
+                ad = torch.tensor(adv[mb], dtype=torch.float32)
+                olp = torch.tensor(np.array(lp_buf)[mb], dtype=torch.float32)
+
+                dist, val = policy(o)
+                lp = dist.log_prob(ac).sum(-1)
+                ratio = (lp - olp).exp()
+
+                loss = (
+                    -torch.min(
+                        ratio * ad,
+                        torch.clamp(ratio, 0.8, 1.2) * ad
+                    ).mean()
+                    + 0.5 * (r - val.squeeze()).pow(2).mean()
+                    - 0.01 * dist.entropy().sum(-1).mean()
+                )
+
+                opt.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
+                opt.step()
+
+        # periodic progress check
+        if it % 200 == 0:
+            log.info(f"  Iter {it}: training...")
+
+    log.info("Phase 0 complete.")
+
+    return {
+        "phase": "0",
+        "baseline_nees": bl_n,
+        "baseline_cons": bl_c,
+        "oracle_nees": or_n,
+        "oracle_cons": or_c,
+    }
+
+
+# ================================================================
+# Baseline Comparison
+# (checking how classical filters stack up against our method)
+# ================================================================
+
+def run_comparison(policy_ckpt, seed, output_dir, log):
+
+    log.info(f"\n{'='*65}\nBaseline Comparison (all methods)\n{'='*65}")
+
+    # locking randomness so comparisons stay fair and repeatable
+    np.random.seed(seed)
+    env = Env6D()
+    rng = np.random.default_rng(seed)
+
+    # generating a pool of training-like tasks (not directly used, just stabilizes RNG state)
+    _ = [sample_task(rng) for _ in range(30)]
+
+    # generating evaluation tasks (these actually matter for reporting)
+    test_tasks = [sample_task(rng) for _ in range(15)]
+
+    # nominal EKF assumptions (what all baselines start from)
+    Q_nom = np.eye(6) * 0.05
+    R_nom = np.eye(2) * 0.5
+
+    n_ep = 10
+
+    # ------------------------------------------------------------
+    # core evaluation loop for any EKF variant
+    # ------------------------------------------------------------
+    def run_bl(task, adapter_fn):
+
+        # fresh EKF per episode (no memory leak between runs)
+        ekf = EKF6D()
+        x_true = np.zeros(6)
+
+        # picking a motion style (keeps dynamics from being too uniform)
+        traj = np.random.choice(["circle", "straight", "random"])
+
+        if traj == "circle":
+            x_true = np.array([2, 0, np.pi / 2, 0, 1, 0.5])
+        elif traj == "straight":
+            x_true = np.array([0, 0, 0, 1, 0, 0])
+
+        # slightly noisy initialization (because perfect state knowledge is not there)
+        x0 = x_true + np.random.randn(6) * 0.2
+
+        # reset EKF with nominal uncertainty
+        ekf.reset(x0, np.eye(6) * 0.5, Q_nom.copy(), R_nom.copy())
+
+        # adapter decides how Q/R evolve over time
+        adapter = adapter_fn(task)
+
+        nees_log = []
+        rmse_log = []
+
+        # --------------------------------------------------------
+        # physics simulation loop
+        # --------------------------------------------------------
+        for t in range(100):
+
+            # grabbing true environment noise for this timestep
+            Qt, Rt = task.get_noise(t)
+
+            # control input (only active in random motion mode)
+            u = np.zeros(3)
+            if traj == "random":
+                u = np.random.randn(3) * 0.3
+
+            # propagate true system
+            x_true = ekf._f(x_true, u) + np.random.multivariate_normal(np.zeros(6), Qt)
+
+            # noisy measurement of position only
+            z = x_true[:2] + np.random.multivariate_normal(np.zeros(2), Rt)
+
+            # EKF prediction step
+            ekf.predict(u)
+
+            # measurement model (hardcoded observation matrix)
+            H = np.zeros((2, 6))
+            H[0, 0] = 1
+            H[1, 1] = 1
+
+            # innovation + covariance
+            nu = z - H @ ekf.x
+            S = H @ ekf.P @ H.T + ekf.R
+            K = ekf.P @ H.T @ np.linalg.inv(S)
+
+            # let the adapter decide how we adjust noise models
+            Q_a, R_a = adapter(nu, ekf.P, S, H, K)
+            ekf.Q = Q_a
+            ekf.R = R_a
+
+            # EKF correction step
+            ekf.x = ekf.x + K @ nu
+            I_KH = np.eye(6) - K @ H
+            ekf.P = I_KH @ ekf.P @ I_KH.T + K @ ekf.R @ K.T
+
+            # keep covariance numerically stable (symmetrize drift)
+            ekf.P = (ekf.P + ekf.P.T) / 2
+
+            # tracking metrics
+            nees_log.append(ekf.compute_nees(x_true))
+            rmse_log.append(float(np.sqrt(np.mean((x_true - ekf.x) ** 2))))
+
+        na = np.array(nees_log)
+
+        return (
+            np.mean(na),
+            float(np.mean((na >= 1.237) & (na <= 14.449))),
+            np.mean(rmse_log),
+            na
+        )
+
+    # baseline: fixed Q/R forever
+    def fixed_adapt(task):
+        Q, R = Q_nom.copy(), R_nom.copy()
+
+        # ignores all innovation signals
+        def adapt(nu, P, S, H, K=None):
+            return Q, R
+
+        return adapt
+
+    # Sage-Husa adaptive filtering (classic exponential update)
+    def sage_adapt(task):
+
+        Q = Q_nom.copy()
+        R = R_nom.copy()
+        b = 0.98
+        step = [0]
+
+        def adapt(nu, P, S, H, K=None):
+            step[0] += 1
+
+            # slowly decreasing learning rate (bias-corrected EMA)
+            dk = (1 - b) / (1 - b**step[0]) if step[0] < 200 else (1 - b)
+
+            nonlocal Q, R
+
+            # innovation-based covariance estimate
+            R_innov = np.outer(nu, nu) - H @ P @ H.T
+            R = (1 - dk) * R + dk * R_innov
+
+            # keeping R numerically safe (PSD projection from eigenvalues)
+            ev, evec = np.linalg.eigh(R)
+            ev = np.maximum(ev, 1e-4)
+            R = evec @ np.diag(ev) @ evec.T
+
+            # same idea for Q (state-driven update)
+            if K is not None:
+                res = K @ nu
+                Q_innov = np.outer(res, res)
+                Q = (1 - dk) * Q + dk * Q_innov
+
+                ev, evec = np.linalg.eigh(Q)
+                ev = np.maximum(ev, 1e-4)
+                Q = evec @ np.diag(ev) @ evec.T
+
+            return Q, R
+
+        return adapt
+
+    # innovation window method (uses recent residual history)
+    def innovation_adapt(task):
+
+        Q = Q_nom.copy()
+        R = R_nom.copy()
+        innovs = []
+        W = 30
+
+        def adapt(nu, P, S, H, K=None):
+            nonlocal R
+
+            # store latest residuals (sliding window memory)
+            innovs.append(nu.copy())
+            if len(innovs) > W:
+                innovs[:] = innovs[-W:]
+
+            # recompute covariance from empirical residual stats
+            if len(innovs) >= W:
+                C = np.mean([np.outer(v, v) for v in innovs], axis=0)
+                R_new = C - H @ P @ H.T
+
+                ev, evec = np.linalg.eigh(R_new)
+                ev = np.maximum(ev, 1e-4)
+                R = evec @ np.diag(ev) @ evec.T
+
+            return Q, R
+
+        return adapt
+
+    # RLS-style diagonal covariance adaptation
+    def rls_adapt(task):
+
+        r = np.diag(R_nom).copy()
+        q = np.diag(Q_nom).copy()
+
+        Pr = np.eye(2) * 100
+        Pq = np.eye(6) * 100
+        lam = 0.995
+
+        def adapt(nu, P, S, H, K=None):
+            nonlocal r, q, Pr, Pq
+
+            # target sensor variance from innovation mismatch
+            r_target = nu**2 - np.diag(H @ P @ H.T)
+
+            # update each measurement dimension separately
+            for i in range(2):
+                e = np.zeros(2)
+                e[i] = 1
+                k = (Pr @ e) / (lam + e @ Pr @ e)
+
+                r[i] += k[i] * (r_target[i] - r[i])
+                Pr = (Pr - np.outer(k, e @ Pr)) / lam
+
+            r[:] = np.maximum(r, 1e-6)
+
+            # same idea for process noise (state-space side)
+            if K is not None:
+                res = K @ nu
+                q_target = res**2
+
+                for i in range(6):
+                    e = np.zeros(6)
+                    e[i] = 1
+                    k = (Pq @ e) / (lam + e @ Pq @ e)
+
+                    q[i] += k[i] * (q_target[i] - q[i])
+                    Pq = (Pq - np.outer(k, e @ Pq)) / lam
+
+                q[:] = np.maximum(q, 1e-6)
+
+            return np.diag(q), np.diag(r)
+
+        return adapt
+
+    # Variational Bayes EKF (probabilistic noise learning)
+    def vbekf_adapt(task):
+
+        Q, R = Q_nom.copy(), R_nom.copy()
+        rho = 0.99
+
+        tau_R = float(4)
+        T_R = R * (tau_R - 3)
+
+        tau_Q = float(8)
+        T_Q = Q * (tau_Q - 7)
+
+        def adapt(nu, P, S, H, K=None):
+            nonlocal Q, R, tau_R, T_R, tau_Q, T_Q
+
+            # a few internal refinement steps per update
+            for _ in range(3):
+
+                B_R = np.outer(nu, nu) + H @ P @ H.T
+                tau_R = rho * tau_R + 1
+                T_R = rho * T_R + B_R
+                R_new = T_R / (tau_R - 3)
+
+                ev = np.linalg.eigvalsh(R_new)
+
+                # stability fallback if covariance becomes invalid
+                R = R_new if np.all(ev > 1e-6) else R_new + np.eye(2) * (abs(min(ev.min(), 0)) + 1e-6)
+
+                if K is not None:
+                    res = K @ nu
+                    B_Q = np.outer(res, res)
+
+                    tau_Q = rho * tau_Q + 1
+                    T_Q = rho * T_Q + B_Q
+                    Q_new = T_Q / (tau_Q - 7)
+
+                    ev = np.linalg.eigvalsh(Q_new)
+                    Q = Q_new if np.all(ev > 1e-6) else Q_new + np.eye(6) * (abs(min(ev.min(), 0)) + 1e-6)
+
+            return Q, R
+
+        return adapt
+
+    # ------------------------------------------------------------
+    # oracle: (uses true noise directly)
+    # ------------------------------------------------------------
+    def oracle_adapt(task):
+        t = [0]
+
+        def adapt(nu, P, S, H, K=None):
+            Q, R = task.get_noise(t[0])
+            t[0] += 1
+            return Q, R
+
+        return adapt
+
+    # list of all methods to evaluate
+    methods = [
+        ("Fixed EKF", fixed_adapt, "Classical"),
+        ("Sage-Husa", sage_adapt, "Classical adaptive"),
+        ("Innovation-Based", innovation_adapt, "Classical adaptive"),
+        ("RLS Covariance", rls_adapt, "Classical adaptive"),
+        ("VB-EKF", vbekf_adapt, "Bayesian adaptive"),
+        ("Oracle EKF", oracle_adapt, "Upper bound"),
+    ]
+
+    # ------------------------------------------------------------
+    # evaluation loop across all methods + tasks
+    # ------------------------------------------------------------
+    results = {}
+    nees_traces = {}
+
+    for name, fn, typ in methods:
+
+        nees_l, cons_l, rmse_l = [], [], []
+        all_traces = []
+
+        # run each method across full test suite
+        for task in test_tasks:
+            for _ in range(n_ep):
+                n, c, r, trace = run_bl(task, fn)
+                nees_l.append(n)
+                cons_l.append(c)
+                rmse_l.append(r)
+                all_traces.append(trace)
+
+        results[name] = {
+            "nees": np.mean(nees_l),
+            "cons": np.mean(cons_l),
+            "rmse": np.mean(rmse_l),
+            "type": typ,
+        }
+
+        nees_traces[name] = np.mean(all_traces, axis=0).tolist()
+
+        log.info(
+            f"  {name:<20} "
+            f"NEES={results[name]['nees']:8.1f} "
+            f"Cons={results[name]['cons']:7.1%} "
+            f"RMSE={results[name]['rmse']:.3f} ({typ})"
+        )
+
+    # ------------------------------------------------------------
+    # evaluate learned meta-policy (if checkpoint exists)
+    # ------------------------------------------------------------
+    if policy_ckpt and Path(policy_ckpt).exists():
+
+        enc = STSIEEncoder(2, 4, 32, 16, 4)
+        pol = Policy(Env6D().obs_dim, 8, enc).to(DEVICE)
+
+        pol.load_state_dict(
+            torch.load(str(policy_ckpt), weights_only=True, map_location=DEVICE)
+        )
+
+        n, c, r = evaluate(env, pol, test_tasks, n_ep)
+
+        results["CC-MetaEKF"] = {
+            "nees": n,
+            "cons": c,
+            "rmse": r,
+            "type": "Meta-RL (ours)",
+        }
+
+        log.info(
+            f"  {'CC-MetaEKF':<20} "
+            f"NEES={n:8.1f} Cons={c:7.1%} RMSE={r:.3f} (Meta-RL, ours)"
+        )
+
+    # saving full comparison logs for later plotting/analysis
+    log_and_save(
+        {"results": results, "nees_traces": nees_traces},
+        "comparison",
+        output_dir,
+    )
+
+    # ------------------------------------------------------------
+    # This is for (how methods behave under different chaos)
+    # ------------------------------------------------------------
+    log.info(f"\n  Per-Scenario Breakdown:")
+
+    scenario_results = {}
+
+    key_methods = [
+        ("Fixed EKF", fixed_adapt),
+        ("Sage-Husa", sage_adapt),
+        ("Oracle EKF", oracle_adapt),
+    ]
+
+    for regime in ["stationary", "abrupt", "drift"]:
+
+        regime_tasks = [t for t in test_tasks if t.regime == regime]
+        if not regime_tasks:
+            continue
+
+        scenario_results[regime] = {}
+
+        # classical baselines first
+        for name, fn in key_methods:
+            nl, cl = [], []
+
+            for task in regime_tasks:
+                for _ in range(n_ep):
+                    n, c, _, _ = run_bl(task, fn)
+                    nl.append(n)
+                    cl.append(c)
+
+            scenario_results[regime][name] = {
+                "nees": np.mean(nl),
+                "cons": np.mean(cl),
+            }
+
+        # add learned policy if available
+        if policy_ckpt and Path(policy_ckpt).exists():
+            n, c, r = evaluate(env, pol, regime_tasks, n_ep)
+            scenario_results[regime]["CC-MetaEKF"] = {"nees": n, "cons": c}
+
+        # printing compact summary per regime
+        log.info(f"    {regime.upper()} ({len(regime_tasks)} tasks):")
+
+        for m in ["Fixed EKF", "Sage-Husa", "CC-MetaEKF", "Oracle EKF"]:
+            if m in scenario_results[regime]:
+                d = scenario_results[regime][m]
+                log.info(
+                    f"      {m:<20} NEES={d['nees']:8.1f} Cons={d['cons']:7.1%}"
+                )
+
+    # final save including scenario breakdown
+    log_and_save(
+        {
+            "results": results,
+            "nees_traces": nees_traces,
+            "per_scenario": scenario_results,
+        },
+        "comparison",
+        output_dir,
+    )
+
+    return results
+
+
+# ================================================================
+# Main Method, the action starts::::::
+# ================================================================
+
+ABLATION_VARIANTS = [
+    ("mlp",   False, "MLP + No Constraint"),
+    ("mlp",   True,  "MLP + PID-CCPO"),
+    ("stsie", False, "ST-SIE + No Constraint"),
+    ("stsie", True,  "ST-SIE + PID-CCPO (Full)"),
+]
+
+def main():
+    parser = argparse.ArgumentParser(description="CC-MetaEKF: One-command pipeline")
+    parser.add_argument("--phase", type=str, default="all",
+                        choices=["all","0","03","1","ablation","comparison"],
+                        help="Which phase to run")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--epochs", type=int, default=0, help="0=auto based on device")
+    parser.add_argument("--steps", type=int, default=0, help="0=auto based on device")
+    args = parser.parse_args()
+
+    # Auto-tune for hardware
+    if args.epochs == 0:
+        args.epochs = 2000 if DEVICE == "cuda" else 800
+    if args.steps == 0:
+        args.steps = 4800 if DEVICE == "cuda" else 2400
+
+    output_dir = Path("results") / f"run_s{args.seed}"
+    log, log_file = setup_logging(output_dir)
+
+    log.info("=" * 65)
+    log.info("CC-MetaEKF: Complete Training")
+    log.info(f"Device: {DEVICE_NAME}")
+    log.info(f"Phase: {args.phase} | Seed: {args.seed}")
+    log.info(f"Epochs: {args.epochs} | Steps/epoch: {args.steps}")
+    log.info(f"Output: {output_dir}")
+    log.info(f"Log: {log_file}")
+    log.info("=" * 65)
+
+    all_results = {}
+
+    # Phase 0
+    if args.phase in ["all", "0"]:
+        r = run_phase0(args.seed, output_dir, log)
+        all_results["phase0"] = r
+        log_and_save(r, "phase0", output_dir)
+
+    # Phase 1: Single best variant
+    if args.phase in ["all", "1"]:
+        r = train_6d("stsie", True, "CC-MetaEKF (ST-SIE + PID-CCPO)",
+                      args.seed, args.epochs, args.steps, output_dir, log)
+        all_results["phase1"] = r
+        log_and_save(r, "phase1_full", output_dir)
+
+    # Ablation matrix
+    if args.phase in ["all", "ablation"]:
+        log.info(f"\n{'='*65}\nAblation Matrix (4 variants)\n{'='*65}")
+        ablation_results = {}
+        for enc, cons, label in ABLATION_VARIANTS:
+            r = train_6d(enc, cons, label, args.seed, args.epochs, args.steps, output_dir, log)
+            key = f"{enc}_{'pid' if cons else 'none'}"
+            ablation_results[key] = r
+            log_and_save(r, f"ablation_{key}", output_dir)
+
+        # Print matrix
+        log.info(f"\n{'='*65}")
+        log.info("ABLATION MATRIX")
+        log.info(f"{'='*65}")
+        log.info(f"{'':>20} {'No Constraint':>18} {'PID-CCPO':>18}")
+        log.info("-" * 58)
+        for enc_name, enc_key in [("MLP", "mlp"), ("ST-SIE", "stsie")]:
+            nc = ablation_results.get(f"{enc_key}_none", {})
+            pc = ablation_results.get(f"{enc_key}_pid" if enc_key=="mlp" else "stsie_pid", {})
+            if enc_key == "stsie": pc = ablation_results.get("stsie_pid", {})
+            nc_s = f"C={nc.get('best_cons',0):.1%}" if nc else "--"
+            pc_s = f"C={pc.get('best_cons',0):.1%}" if pc else "--"
+            log.info(f"{enc_name:>20} {nc_s:>18} {pc_s:>18}")
+        log.info(f"{'='*65}")
+        all_results["ablation"] = ablation_results
+
+    # Comparison
+    if args.phase in ["all", "comparison"]:
+        ckpt = output_dir / "best_stsie_pid_s{}.pt".format(args.seed)
+        if not ckpt.exists():
+            ckpt = Path("checkpoints/best_6d.pt")
+        r = run_comparison(str(ckpt) if ckpt.exists() else None, args.seed, output_dir, log)
+        all_results["comparison"] = r
+
+    # Final summary
+    log.info(f"\n{'='*65}")
+    log.info("ALL DONE")
+    log.info(f"Results saved to: {output_dir}")
+    log.info(f"Log file: {log_file}")
+    log.info(f"{'='*65}")
+
+    log_and_save(all_results, "all_results", output_dir)
+
+
+if __name__ == "__main__":
+    main()
