@@ -1295,3 +1295,441 @@ def run_phase0(seed, output_dir, log):
         "oracle_nees": or_n,
         "oracle_cons": or_c,
     }
+
+
+# ================================================================
+# Baseline Comparison
+# (checking how classical filters stack up against our method)
+# ================================================================
+
+def run_comparison(policy_ckpt, seed, output_dir, log):
+
+    log.info(f"\n{'='*65}\nBaseline Comparison (all methods)\n{'='*65}")
+
+    # locking randomness so comparisons stay fair and repeatable
+    np.random.seed(seed)
+    env = Env6D()
+    rng = np.random.default_rng(seed)
+
+    # generating a pool of training-like tasks (not directly used, just stabilizes RNG state)
+    _ = [sample_task(rng) for _ in range(30)]
+
+    # generating evaluation tasks (these actually matter for reporting)
+    test_tasks = [sample_task(rng) for _ in range(15)]
+
+    # nominal EKF assumptions (what all baselines start from)
+    Q_nom = np.eye(6) * 0.05
+    R_nom = np.eye(2) * 0.5
+
+    n_ep = 10
+
+    # ------------------------------------------------------------
+    # core evaluation loop for any EKF variant
+    # ------------------------------------------------------------
+    def run_bl(task, adapter_fn):
+
+        # fresh EKF per episode (no memory leak between runs)
+        ekf = EKF6D()
+        x_true = np.zeros(6)
+
+        # picking a motion style (keeps dynamics from being too uniform)
+        traj = np.random.choice(["circle", "straight", "random"])
+
+        if traj == "circle":
+            x_true = np.array([2, 0, np.pi / 2, 0, 1, 0.5])
+        elif traj == "straight":
+            x_true = np.array([0, 0, 0, 1, 0, 0])
+
+        # slightly noisy initialization (because perfect state knowledge is not there)
+        x0 = x_true + np.random.randn(6) * 0.2
+
+        # reset EKF with nominal uncertainty
+        ekf.reset(x0, np.eye(6) * 0.5, Q_nom.copy(), R_nom.copy())
+
+        # adapter decides how Q/R evolve over time
+        adapter = adapter_fn(task)
+
+        nees_log = []
+        rmse_log = []
+
+        # --------------------------------------------------------
+        # physics simulation loop
+        # --------------------------------------------------------
+        for t in range(100):
+
+            # grabbing true environment noise for this timestep
+            Qt, Rt = task.get_noise(t)
+
+            # control input (only active in random motion mode)
+            u = np.zeros(3)
+            if traj == "random":
+                u = np.random.randn(3) * 0.3
+
+            # propagate true system
+            x_true = ekf._f(x_true, u) + np.random.multivariate_normal(np.zeros(6), Qt)
+
+            # noisy measurement of position only
+            z = x_true[:2] + np.random.multivariate_normal(np.zeros(2), Rt)
+
+            # EKF prediction step
+            ekf.predict(u)
+
+            # measurement model (hardcoded observation matrix)
+            H = np.zeros((2, 6))
+            H[0, 0] = 1
+            H[1, 1] = 1
+
+            # innovation + covariance
+            nu = z - H @ ekf.x
+            S = H @ ekf.P @ H.T + ekf.R
+            K = ekf.P @ H.T @ np.linalg.inv(S)
+
+            # let the adapter decide how we adjust noise models
+            Q_a, R_a = adapter(nu, ekf.P, S, H, K)
+            ekf.Q = Q_a
+            ekf.R = R_a
+
+            # EKF correction step
+            ekf.x = ekf.x + K @ nu
+            I_KH = np.eye(6) - K @ H
+            ekf.P = I_KH @ ekf.P @ I_KH.T + K @ ekf.R @ K.T
+
+            # keep covariance numerically stable (symmetrize drift)
+            ekf.P = (ekf.P + ekf.P.T) / 2
+
+            # tracking metrics
+            nees_log.append(ekf.compute_nees(x_true))
+            rmse_log.append(float(np.sqrt(np.mean((x_true - ekf.x) ** 2))))
+
+        na = np.array(nees_log)
+
+        return (
+            np.mean(na),
+            float(np.mean((na >= 1.237) & (na <= 14.449))),
+            np.mean(rmse_log),
+            na
+        )
+
+    # baseline: fixed Q/R forever
+    def fixed_adapt(task):
+        Q, R = Q_nom.copy(), R_nom.copy()
+
+        # ignores all innovation signals
+        def adapt(nu, P, S, H, K=None):
+            return Q, R
+
+        return adapt
+
+    # Sage-Husa adaptive filtering (classic exponential update)
+    def sage_adapt(task):
+
+        Q = Q_nom.copy()
+        R = R_nom.copy()
+        b = 0.98
+        step = [0]
+
+        def adapt(nu, P, S, H, K=None):
+            step[0] += 1
+
+            # slowly decreasing learning rate (bias-corrected EMA)
+            dk = (1 - b) / (1 - b**step[0]) if step[0] < 200 else (1 - b)
+
+            nonlocal Q, R
+
+            # innovation-based covariance estimate
+            R_innov = np.outer(nu, nu) - H @ P @ H.T
+            R = (1 - dk) * R + dk * R_innov
+
+            # keeping R numerically safe (PSD projection from eigenvalues)
+            ev, evec = np.linalg.eigh(R)
+            ev = np.maximum(ev, 1e-4)
+            R = evec @ np.diag(ev) @ evec.T
+
+            # same idea for Q (state-driven update)
+            if K is not None:
+                res = K @ nu
+                Q_innov = np.outer(res, res)
+                Q = (1 - dk) * Q + dk * Q_innov
+
+                ev, evec = np.linalg.eigh(Q)
+                ev = np.maximum(ev, 1e-4)
+                Q = evec @ np.diag(ev) @ evec.T
+
+            return Q, R
+
+        return adapt
+
+    # innovation window method (uses recent residual history)
+    def innovation_adapt(task):
+
+        Q = Q_nom.copy()
+        R = R_nom.copy()
+        innovs = []
+        W = 30
+
+        def adapt(nu, P, S, H, K=None):
+            nonlocal R
+
+            # store latest residuals (sliding window memory)
+            innovs.append(nu.copy())
+            if len(innovs) > W:
+                innovs[:] = innovs[-W:]
+
+            # recompute covariance from empirical residual stats
+            if len(innovs) >= W:
+                C = np.mean([np.outer(v, v) for v in innovs], axis=0)
+                R_new = C - H @ P @ H.T
+
+                ev, evec = np.linalg.eigh(R_new)
+                ev = np.maximum(ev, 1e-4)
+                R = evec @ np.diag(ev) @ evec.T
+
+            return Q, R
+
+        return adapt
+
+    # RLS-style diagonal covariance adaptation
+    def rls_adapt(task):
+
+        r = np.diag(R_nom).copy()
+        q = np.diag(Q_nom).copy()
+
+        Pr = np.eye(2) * 100
+        Pq = np.eye(6) * 100
+        lam = 0.995
+
+        def adapt(nu, P, S, H, K=None):
+            nonlocal r, q, Pr, Pq
+
+            # target sensor variance from innovation mismatch
+            r_target = nu**2 - np.diag(H @ P @ H.T)
+
+            # update each measurement dimension separately
+            for i in range(2):
+                e = np.zeros(2)
+                e[i] = 1
+                k = (Pr @ e) / (lam + e @ Pr @ e)
+
+                r[i] += k[i] * (r_target[i] - r[i])
+                Pr = (Pr - np.outer(k, e @ Pr)) / lam
+
+            r[:] = np.maximum(r, 1e-6)
+
+            # same idea for process noise (state-space side)
+            if K is not None:
+                res = K @ nu
+                q_target = res**2
+
+                for i in range(6):
+                    e = np.zeros(6)
+                    e[i] = 1
+                    k = (Pq @ e) / (lam + e @ Pq @ e)
+
+                    q[i] += k[i] * (q_target[i] - q[i])
+                    Pq = (Pq - np.outer(k, e @ Pq)) / lam
+
+                q[:] = np.maximum(q, 1e-6)
+
+            return np.diag(q), np.diag(r)
+
+        return adapt
+
+    # Variational Bayes EKF (probabilistic noise learning)
+    def vbekf_adapt(task):
+
+        Q, R = Q_nom.copy(), R_nom.copy()
+        rho = 0.99
+
+        tau_R = float(4)
+        T_R = R * (tau_R - 3)
+
+        tau_Q = float(8)
+        T_Q = Q * (tau_Q - 7)
+
+        def adapt(nu, P, S, H, K=None):
+            nonlocal Q, R, tau_R, T_R, tau_Q, T_Q
+
+            # a few internal refinement steps per update
+            for _ in range(3):
+
+                B_R = np.outer(nu, nu) + H @ P @ H.T
+                tau_R = rho * tau_R + 1
+                T_R = rho * T_R + B_R
+                R_new = T_R / (tau_R - 3)
+
+                ev = np.linalg.eigvalsh(R_new)
+
+                # stability fallback if covariance becomes invalid
+                R = R_new if np.all(ev > 1e-6) else R_new + np.eye(2) * (abs(min(ev.min(), 0)) + 1e-6)
+
+                if K is not None:
+                    res = K @ nu
+                    B_Q = np.outer(res, res)
+
+                    tau_Q = rho * tau_Q + 1
+                    T_Q = rho * T_Q + B_Q
+                    Q_new = T_Q / (tau_Q - 7)
+
+                    ev = np.linalg.eigvalsh(Q_new)
+                    Q = Q_new if np.all(ev > 1e-6) else Q_new + np.eye(6) * (abs(min(ev.min(), 0)) + 1e-6)
+
+            return Q, R
+
+        return adapt
+
+    # ------------------------------------------------------------
+    # oracle: (uses true noise directly)
+    # ------------------------------------------------------------
+    def oracle_adapt(task):
+        t = [0]
+
+        def adapt(nu, P, S, H, K=None):
+            Q, R = task.get_noise(t[0])
+            t[0] += 1
+            return Q, R
+
+        return adapt
+
+    # list of all methods to evaluate
+    methods = [
+        ("Fixed EKF", fixed_adapt, "Classical"),
+        ("Sage-Husa", sage_adapt, "Classical adaptive"),
+        ("Innovation-Based", innovation_adapt, "Classical adaptive"),
+        ("RLS Covariance", rls_adapt, "Classical adaptive"),
+        ("VB-EKF", vbekf_adapt, "Bayesian adaptive"),
+        ("Oracle EKF", oracle_adapt, "Upper bound"),
+    ]
+
+    # ------------------------------------------------------------
+    # evaluation loop across all methods + tasks
+    # ------------------------------------------------------------
+    results = {}
+    nees_traces = {}
+
+    for name, fn, typ in methods:
+
+        nees_l, cons_l, rmse_l = [], [], []
+        all_traces = []
+
+        # run each method across full test suite
+        for task in test_tasks:
+            for _ in range(n_ep):
+                n, c, r, trace = run_bl(task, fn)
+                nees_l.append(n)
+                cons_l.append(c)
+                rmse_l.append(r)
+                all_traces.append(trace)
+
+        results[name] = {
+            "nees": np.mean(nees_l),
+            "cons": np.mean(cons_l),
+            "rmse": np.mean(rmse_l),
+            "type": typ,
+        }
+
+        nees_traces[name] = np.mean(all_traces, axis=0).tolist()
+
+        log.info(
+            f"  {name:<20} "
+            f"NEES={results[name]['nees']:8.1f} "
+            f"Cons={results[name]['cons']:7.1%} "
+            f"RMSE={results[name]['rmse']:.3f} ({typ})"
+        )
+
+    # ------------------------------------------------------------
+    # evaluate learned meta-policy (if checkpoint exists)
+    # ------------------------------------------------------------
+    if policy_ckpt and Path(policy_ckpt).exists():
+
+        enc = STSIEEncoder(2, 4, 32, 16, 4)
+        pol = Policy(Env6D().obs_dim, 8, enc).to(DEVICE)
+
+        pol.load_state_dict(
+            torch.load(str(policy_ckpt), weights_only=True, map_location=DEVICE)
+        )
+
+        n, c, r = evaluate(env, pol, test_tasks, n_ep)
+
+        results["CC-MetaEKF"] = {
+            "nees": n,
+            "cons": c,
+            "rmse": r,
+            "type": "Meta-RL (ours)",
+        }
+
+        log.info(
+            f"  {'CC-MetaEKF':<20} "
+            f"NEES={n:8.1f} Cons={c:7.1%} RMSE={r:.3f} (Meta-RL, ours)"
+        )
+
+    # saving full comparison logs for later plotting/analysis
+    log_and_save(
+        {"results": results, "nees_traces": nees_traces},
+        "comparison",
+        output_dir,
+    )
+
+    # ------------------------------------------------------------
+    # This is for (how methods behave under different chaos)
+    # ------------------------------------------------------------
+    log.info(f"\n  Per-Scenario Breakdown:")
+
+    scenario_results = {}
+
+    key_methods = [
+        ("Fixed EKF", fixed_adapt),
+        ("Sage-Husa", sage_adapt),
+        ("Oracle EKF", oracle_adapt),
+    ]
+
+    for regime in ["stationary", "abrupt", "drift"]:
+
+        regime_tasks = [t for t in test_tasks if t.regime == regime]
+        if not regime_tasks:
+            continue
+
+        scenario_results[regime] = {}
+
+        # classical baselines first
+        for name, fn in key_methods:
+            nl, cl = [], []
+
+            for task in regime_tasks:
+                for _ in range(n_ep):
+                    n, c, _, _ = run_bl(task, fn)
+                    nl.append(n)
+                    cl.append(c)
+
+            scenario_results[regime][name] = {
+                "nees": np.mean(nl),
+                "cons": np.mean(cl),
+            }
+
+        # add learned policy if available
+        if policy_ckpt and Path(policy_ckpt).exists():
+            n, c, r = evaluate(env, pol, regime_tasks, n_ep)
+            scenario_results[regime]["CC-MetaEKF"] = {"nees": n, "cons": c}
+
+        # printing compact summary per regime
+        log.info(f"    {regime.upper()} ({len(regime_tasks)} tasks):")
+
+        for m in ["Fixed EKF", "Sage-Husa", "CC-MetaEKF", "Oracle EKF"]:
+            if m in scenario_results[regime]:
+                d = scenario_results[regime][m]
+                log.info(
+                    f"      {m:<20} NEES={d['nees']:8.1f} Cons={d['cons']:7.1%}"
+                )
+
+    # final save including scenario breakdown
+    log_and_save(
+        {
+            "results": results,
+            "nees_traces": nees_traces,
+            "per_scenario": scenario_results,
+        },
+        "comparison",
+        output_dir,
+    )
+
+    return results
+
