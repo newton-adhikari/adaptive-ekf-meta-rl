@@ -857,3 +857,155 @@ def evaluate(env,policy,tasks,n_ep=5):
     # returning averaged evaluation metrics
     return (np.mean([r["nees"] for r in results]),np.mean([r["cons"] for r in results]),
             np.mean([r["rmse"] for r in results]))
+
+
+# ================================================================
+# Training function (used by all phases)
+# ================================================================
+
+def train_6d(encoder_type, use_constraint, label, seed, epochs, steps_per_epoch,
+             output_dir, log):
+
+    # setting random seeds for reproducible training
+    np.random.seed(seed); torch.manual_seed(seed)
+
+    # creating environment and random generator
+    env=Env6D(ep_len=100); rng=np.random.default_rng(seed)
+
+    # generating training tasks
+    train_tasks=[sample_task(rng) for _ in range(30)]
+
+    # generating testing tasks
+    test_tasks=[sample_task(rng) for _ in range(15)]
+
+    # selecting encoder based on experiment type
+    if encoder_type=="stsie":
+
+        # using spectral-temporal encoder
+        enc=STSIEEncoder(2,4,32,16,4)
+    else:
+
+        # using simple mlp encoder
+        enc=MLPEncoder(env.ctx_len*2,4,32)
+
+    # creating policy network
+    policy=Policy(env.obs_dim,env.act_dim,enc).to(DEVICE)
+
+    # setting initial learning rate
+    lr0=3e-4
+
+    # creating optimizer
+    opt=torch.optim.Adam(policy.parameters(),lr=lr0)
+
+    # creating pid lagrangian controller
+    pid=PIDLag()
+
+    # storing best consistency score
+    pid=PIDLag(); best_cons=0; no_imp=0
+
+    # making checkpoint file path
+    ckpt=output_dir/f"best_{encoder_type}_{'pid' if use_constraint else 'none'}_s{seed}.pt"
+
+    # printing training header
+    log.info(f"\n{'='*65}")
+    log.info(f"Training: {label} | seed={seed} | {DEVICE_NAME}")
+    log.info(f"{'='*65}")
+
+    # running baseline evaluation with untrained mlp policy
+    bn,bc,br=evaluate(env,Policy(env.obs_dim,env.act_dim,
+        MLPEncoder(env.ctx_len*2,4,32)).to(DEVICE),test_tasks[:5],3)
+
+    # logging baseline results
+    log.info(f"Baseline: NEES={bn:.1f} Cons={bc:.1%} RMSE={br:.3f}")
+
+    # creating history storage
+    history=[]
+
+    # starting training epochs
+    for ep in range(1,epochs+1):
+
+        # starting epoch timer
+        t0=time.time()
+
+        # calculating learning rate decay fraction
+        frac=1-(ep-1)/epochs
+
+        # updating learning rate
+        for pg in opt.param_groups: pg['lr']=lr0*max(frac,0.02)
+
+        # updating ppo clip value
+        clip_now=0.2*max(frac,0.1)
+
+        # changing environment randomness each epoch
+        env.rng=np.random.default_rng(seed+ep)
+
+        # using smaller action range during warmup for avoiding divergence
+        act_clip = 2.0 if ep <= 200 else 5.0
+
+        # collecting rollout samples
+        ob,ib,fs,ab,rb,cb,db,lpb,vb,cvb=collect(env,policy,steps_per_epoch,action_clip=act_clip)
+
+        # calculating returns and advantages
+        ret,adv,cret,cadv=compute_gae(rb,vb,cb,cvb,db)
+
+        # updating policy using ppo
+        losses=ppo_update(policy,opt,pid,ob,ib,fs,ab,ret,adv,cret,cadv,lpb,cb,
+                          use_constraint=use_constraint,clip=clip_now)
+
+        # calculating epoch runtime
+        elapsed=time.time()-t0
+
+        # the great, training progress
+        if ep%10==0 or ep<=3:
+            log.info(f"  Ep {ep:4d}/{epochs} | pi={losses['pi']:.3f} lam={losses['lam']:.3f} "
+                     f"viol={losses['viol']:.3f} | {elapsed:.1f}s")
+
+        # running evaluation every 50 epochs
+        if ep%50==0:
+
+            # evaluating on training tasks
+            tn,tc,tr=evaluate(env,policy,train_tasks[:10],5)
+
+            # evaluating on testing tasks
+            en,ec,er=evaluate(env,policy,test_tasks[:10],5)
+
+            # preparing best model marker
+            tag=""
+
+            # checking for improvement in consistency
+            if ec>best_cons:
+
+                # saving best model checkpoint
+                best_cons=ec; no_imp=0; torch.save(policy.state_dict(),str(ckpt)); tag=" *"
+            else:
+
+                # counting epochs without improvement
+                no_imp+=50
+
+            # logging evaluation results
+            log.info(f"    [Eval] Train: NEES={tn:.1f} Cons={tc:.1%} | "
+                     f"Test: NEES={en:.1f} Cons={ec:.1%} RMSE={er:.3f}{tag}")
+
+            # storing evaluation history
+            history.append({"ep":ep,"train_nees":tn,"train_cons":tc,"test_nees":en,"test_cons":ec,"test_rmse":er})
+
+    # running final evaluation on all training tasks
+    fn,fc,fr=evaluate(env,policy,train_tasks,5)
+
+    # running final evaluation on all testing tasks
+    en,ec,er=evaluate(env,policy,test_tasks,5)
+
+    # logging final results
+    log.info(f"\nFinal: Train NEES={fn:.1f} Cons={fc:.1%} | Test NEES={en:.1f} Cons={ec:.1%} RMSE={er:.3f}")
+
+    # logging best consistency achieved
+    log.info(f"Best test consistency: {best_cons:.1%}")
+
+    # collecting all experiment results
+    result={"label":label,"encoder":encoder_type,"constraint":use_constraint,"seed":seed,
+            "baseline":{"nees":bn,"cons":bc,"rmse":br},
+            "train":{"nees":fn,"cons":fc,"rmse":fr},"test":{"nees":en,"cons":ec,"rmse":er},
+            "best_cons":best_cons,"history":history}
+
+    # returning final result dictionary
+    return result
