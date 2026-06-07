@@ -275,3 +275,263 @@ class EKF1D:
         except:
             # Returning large value if inversion fails
             return 100.0
+        
+
+# ================================================================
+# Tasks and Environments
+# ================================================================
+
+class Task:
+    def __init__(self, Q_diag, R_diag, regime="stationary", ct=50):
+
+        # Stored baseline process and measurement noise
+        self.Q_base = np.array(Q_diag)
+        self.R_base = np.array(R_diag)
+
+        # Remembered what kind of chaos this task wanted
+        self.regime = regime
+        self.change_time = ct
+
+        # Generated future noise values for abrupt changes
+        # Basically preparing a surprise attack for the EKF
+        self.Q_after = self.Q_base * np.random.choice([0.2, 5.0], size=len(Q_diag))
+        self.R_after = self.R_base * np.random.choice([0.2, 5.0], size=len(R_diag))
+
+    def get_noise(self, t):
+
+        # Keeping life easy: noise never changed
+        if self.regime == "stationary":
+            return np.diag(self.Q_base), np.diag(self.R_base)
+
+        # Noise suddenly woke up and chose violence
+        elif self.regime == "abrupt" and t >= self.change_time:
+            return np.diag(self.Q_after), np.diag(self.R_after)
+
+        # Slowly increasing uncertainty over time
+        elif self.regime == "drift":
+            s = 1 + 0.005 * t
+            return np.diag(self.Q_base * s), np.diag(self.R_base * s)
+
+        # Falling back to default noise values
+        return np.diag(self.Q_base), np.diag(self.R_base)
+
+
+def sample_task(rng):
+
+    # Sampled process noise from a log-uniform distribution
+    q = np.exp(rng.uniform(np.log(0.005), np.log(0.2), 6))
+
+    # Sampled measurement noise
+    r = np.exp(rng.uniform(np.log(0.05), np.log(2.0), 2))
+
+    # Randomly picked a world behavior
+    regime = rng.choice(
+        ["stationary", "abrupt", "drift"],
+        p=[0.5, 0.3, 0.2]
+    )
+
+    # Created a fresh task for the agent to suffer through
+    return Task(q, r, regime, rng.integers(30, 70))
+
+
+class Env6D:
+
+    def __init__(self, ep_len=100):
+
+        # Stored episode length
+        self.ep_len = ep_len
+
+        # Created EKF instance
+        self.ekf = EKF6D()
+
+        # Set nominal covariance values
+        self.Q_nom = np.eye(6) * 0.05
+        self.R_nom = np.eye(2) * 0.5
+
+        # Keeping recent innovation history
+        self.ctx_len = 30
+
+        # Number of innovations exposed to the policy
+        self.n_innov = 5
+
+        # Observation vector size
+        self.obs_dim = self.n_innov*2 + 1 + 1 + 1 + 6 + 6 + 2
+
+        # Action controls 6 Q values + 2 R values
+        self.act_dim = 8
+
+        # Created RNG for generating random nonsense responsibly
+        self.rng = np.random.default_rng()
+
+    def reset(self, task=None):
+
+        # Generated a new task if none was supplied
+        self.task = task or sample_task(self.rng)
+
+        # Reset episode clock
+        self.t = 0
+
+        # Chose a trajectory type
+        traj = self.rng.choice(["circle", "straight", "random"])
+        self.traj_type = traj
+
+        # Started with zero state
+        self.x_true = np.zeros(6)
+
+        # Spawned circular motion
+        if traj == "circle":
+            self.x_true = np.array([2, 0, np.pi/2, 0, 1.0, 0.5])
+
+        # Spawned boring but predictable straight motion
+        elif traj == "straight":
+            self.x_true = np.array([0, 0, 0, 1, 0, 0])
+
+        # Added initialization error because perfect sensors only exist in slides
+        x0 = self.x_true + self.rng.normal(0, 0.2, 6)
+
+        # Reset EKF state
+        self.ekf.reset(
+            x0,
+            np.eye(6) * 0.5,
+            self.Q_nom.copy(),
+            self.R_nom.copy()
+        )
+
+        # Started innovation history
+        self.innovs = [[0.0, 0.0]] * self.ctx_len
+
+        # Started NEES history tracking
+        self.nees_history = []
+
+        return self._obs(), self._ctx()
+
+    def step(self, action):
+
+        # Converted actions into positive scaling factors
+        alphas = np.clip(np.exp(action), 0.01, 100.0)
+
+        # Updated EKF covariance guesses
+        self.ekf.Q = np.diag(alphas[:6]) @ self.Q_nom
+        self.ekf.R = np.diag(alphas[6:]) @ self.R_nom
+
+        # Retrieved actual environment noise
+        Q_true, R_true = self.task.get_noise(self.t)
+
+        # Started with zero control input
+        u = np.zeros(3)
+
+        # Generated random controls for the random trajectory
+        if self.traj_type == "random":
+            u = self.rng.normal(0, 0.3, 3)
+
+        # Propagated true state using real noise
+        self.x_true = (
+            self.ekf._f(self.x_true, u)
+            + self.rng.multivariate_normal(np.zeros(6), Q_true)
+        )
+
+        # Generated noisy position measurement
+        z = (
+            self.x_true[:2]
+            + self.rng.multivariate_normal(np.zeros(2), R_true)
+        )
+
+        # Running EKF predict-update cycle
+        self.ekf.predict(u)
+        nu = self.ekf.update(z)
+
+        # Calculated consistency score
+        nees = self.ekf.compute_nees(self.x_true)
+
+        # Stored latest innovation
+        self.innovs.append(nu.tolist())
+
+        # Keeping only recent history
+        self.innovs = self.innovs[-self.ctx_len:]
+
+        self.t += 1
+
+        # Checking whether episode finished
+        done = self.t >= self.ep_len
+
+        # Tracking NEES history for smoother rewards
+        self.nees_history.append(nees)
+
+        # Averaging recent consistency values
+        avg_nees = np.mean(self.nees_history[-20:])
+
+        # Measuring state estimation error
+        rmse = float(
+            np.sqrt(np.mean((self.x_true - self.ekf.x) ** 2))
+        )
+
+        # Rewarding NEES staying near target value
+        # Less drama = more reward
+        reward = -np.log1p(abs(avg_nees - 6))
+
+        # Punishing large estimation errors
+        reward -= 0.05 * min(rmse, 10.0)
+
+        # EKF behaving itself earned bonus points
+        if self.ekf.is_consistent():
+            reward += 0.3
+
+        # Running average staying in healthy range
+        if 3.0 <= avg_nees <= 12.0:
+            reward += 0.3
+
+        return (
+            self._obs(),
+            self._ctx(),
+            reward,
+            done,
+            {
+                "nees": nees,
+                "rmse": rmse,
+                "consistent": self.ekf.is_consistent()
+            }
+        )
+
+    def _obs(self):
+
+        # Flattening recent innovations into one vector
+        iv = np.array(
+            self.innovs[-self.n_innov:]
+        ).flatten()
+
+        # Building observation features for the policy
+        # Compressing huge values before they start causing drama
+        return np.clip(
+            np.concatenate([
+                iv,
+
+                # Normalized consistency metrics
+                [self.ekf.nees / 6,
+                 self.ekf.nis / 2],
+
+                # Tracking covariance growth
+                [np.log1p(max(np.trace(self.ekf.P), 0))],
+
+                # State uncertainty
+                np.log1p(np.maximum(np.diag(self.ekf.P), 0)),
+
+                # Process noise estimate
+                np.log1p(np.maximum(np.diag(self.ekf.Q), 0)),
+
+                # Measurement noise estimate
+                np.log1p(np.maximum(np.diag(self.ekf.R), 0))
+            ]),
+            -20,
+            20
+        ).astype(np.float32)
+
+    def _ctx(self):
+
+        # Returning full innovation history
+        # Agent memory, because forgetting is bad
+        return np.array(
+            self.innovs,
+            dtype=np.float32
+        ).flatten()
+
+
