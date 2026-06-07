@@ -535,3 +535,325 @@ class Env6D:
         ).flatten()
 
 
+# ================================================================
+# Networks
+# ================================================================
+
+class STSIEEncoder(nn.Module):
+    def __init__(self, innov_dim=2, filter_dim=4, latent=32, window=16, hop=4):
+        super().__init__(); self.window=window; self.hop=hop; ch=16
+
+        # making cnn layers for taking spectral features
+        self.cnn=nn.Sequential(nn.Conv2d(innov_dim,ch,3,padding=1),nn.ReLU(),
+            nn.Conv2d(ch,ch*2,3,padding=1),nn.ReLU(),nn.AdaptiveAvgPool2d((4,4)))
+
+        # making projection for spectral embedding
+        self.embed=64; self.sp=nn.Linear(ch*2*16,self.embed)
+
+        # making filter statistic embedding
+        self.fe=nn.Sequential(nn.Linear(filter_dim,self.embed),nn.ReLU(),nn.Linear(self.embed,self.embed))
+
+        # using attention for joining spectral and filter info
+        self.ca=nn.MultiheadAttention(self.embed,4,batch_first=True)
+
+        # making final latent feature output
+        self.out=nn.Sequential(nn.Linear(self.embed+filter_dim,latent),nn.ReLU(),nn.Linear(latent,latent))
+
+        # storing hann window for fft processing
+        self.register_buffer("hann",torch.hann_window(window).float())
+
+    def _spec(self, buf):
+        B,L,D=buf.shape
+
+        # checking if buffer is smaller than window
+        if L < self.window:
+            # adding zero padding for matching window size
+            pad = torch.zeros(B, self.window - L, D, device=buf.device)
+            buf = torch.cat([pad, buf], dim=1)
+            L = self.window
+
+        # calculating number of frames
+        nf=max(1,(L-self.window)//self.hop+1)
+
+        # making overlapping frames from buffer
+        fr=torch.stack([buf[:,i*self.hop:i*self.hop+self.window] for i in range(nf)],1)
+
+        # applying hann window on frames
+        fr=fr*self.hann[None,None,:,None]
+
+        # reshaping for fft calculation
+        flat=fr.permute(0,1,3,2).reshape(-1,self.window)
+
+        # calculating power spectrum
+        fft=torch.fft.rfft(flat, dim=-1); pw=(fft.abs()**2)/self.window
+
+        # returning log power spectrum
+        return torch.log(pw.reshape(B,nf,D,self.window//2+1).permute(0,2,1,3)+1e-10)
+
+    def forward(self, ib, fs):
+
+        # extracting spectral features
+        s=self._spec(ib); f=self.cnn(s).flatten(1)
+
+        # making spectral token and filter token
+        st=self.sp(f).unsqueeze(1); q=self.fe(fs).unsqueeze(1)
+
+        # applying cross attention
+        a,_=self.ca(q,st,st)
+
+        # returning latent representation
+        return self.out(torch.cat([a.squeeze(1),fs],-1))
+
+class MLPEncoder(nn.Module):
+    def __init__(self, ctx_dim, filter_dim=4, latent=32):
+        super().__init__()
+
+        # making simple mlp encoder
+        self.net=nn.Sequential(nn.Linear(ctx_dim+filter_dim,128),nn.ReLU(),nn.Linear(128,64),nn.ReLU(),nn.Linear(64,latent))
+
+    def forward(self, ib, fs):
+
+        # joining inputs and making latent feature
+        return self.net(torch.cat([ib.flatten(1),fs],-1))
+
+class Policy(nn.Module):
+    def __init__(self, obs_dim, act_dim, encoder, hidden=256):
+        super().__init__(); self.encoder=encoder; latent=32; inp=obs_dim+latent
+
+        # making actor network for action generation
+        self.actor=nn.Sequential(nn.Linear(inp,hidden),nn.Tanh(),nn.Linear(hidden,hidden),nn.Tanh())
+
+        # making mean and std parameters
+        self.mean=nn.Linear(hidden,act_dim); self.log_std=nn.Parameter(torch.zeros(act_dim)-0.5)
+
+        # making reward critic network
+        self.critic=nn.Sequential(nn.Linear(inp,hidden),nn.Tanh(),nn.Linear(hidden,hidden),nn.Tanh(),nn.Linear(hidden,1))
+
+        # making cost critic network
+        self.cost_critic=nn.Sequential(nn.Linear(inp,hidden),nn.Tanh(),nn.Linear(hidden,hidden),nn.Tanh(),nn.Linear(hidden,1))
+
+    def forward(self, obs, ib, fs):
+
+        # encoding innovation and filter stats
+        z=self.encoder(ib,fs)
+
+        # joining observation and latent feature
+        x=torch.cat([obs,z],-1)
+
+        # making actor hidden feature
+        h=self.actor(x)
+
+        # returning action distribution and critics
+        return Normal(self.mean(h),self.log_std.exp().expand(obs.shape[0],-1)),self.critic(x),self.cost_critic(x)
+
+    def act(self, obs, ib, fs):
+        with torch.no_grad():
+
+            # getting policy outputs
+            d,v,cv=self.forward(obs,ib,fs)
+
+            # sampling action from distribution
+            a=d.sample()
+
+            # calculating action log probability
+            lp=d.log_prob(a).sum(-1)
+
+        # returning numpy values
+        return a.cpu().numpy(),lp.cpu().numpy(),v.cpu().numpy(),cv.cpu().numpy()
+
+class PIDLag:
+    def __init__(self,delta=0.15,kp=0.1,ki=0.008,kd=0.02,imax=5):
+
+        # storing pid parameters
+        self.delta=delta;self.kp=kp;self.ki=ki;self.kd=kd;self.imax=imax
+
+        # initializing lagrangian values
+        self.lam=0;self.integral=0;self.prev=0
+
+    def update(self,vr):
+
+        # calculating constraint error
+        e=vr-self.delta
+
+        # updating integral term
+        self.integral=np.clip(self.integral+e,-self.imax,self.imax)
+
+        # calculating derivative term
+        d=e-self.prev; self.prev=e
+
+        # updating lagrangian multiplier
+        self.lam=max(0,self.kp*e+self.ki*self.integral+self.kd*d)
+
+        return self.lam
+
+    def reset(self):
+
+        # resetting pid states
+        self.lam=0;self.integral=0;self.prev=0
+
+
+# ================================================================
+# PPO Core
+# ================================================================
+
+def compute_gae(rew,val,cost,cval,done,gamma=0.99,lam=0.95):
+
+    # creating advantage buffers
+    T=len(rew); adv=np.zeros(T); cadv=np.zeros(T); lg=0; clg=0
+
+    # going backward for gae calculation
+    for t in reversed(range(T)):
+
+        # getting next values
+        nv=val[t+1] if t+1<len(val) else 0; ncv=cval[t+1] if t+1<len(cval) else 0
+
+        # calculating reward advantage
+        d=rew[t]+gamma*nv*(1-done[t])-val[t]; adv[t]=lg=d+gamma*lam*(1-done[t])*lg
+
+        # calculating cost advantage
+        cd=cost[t]+gamma*ncv*(1-done[t])-cval[t]; cadv[t]=clg=cd+gamma*lam*(1-done[t])*clg
+
+    # returning returns and advantages
+    return adv+np.array(val[:T]),adv,cadv+np.array(cval[:T]),cadv
+
+def ppo_update(policy,opt,pid,ob,ib,fs,act,ret,adv,cret,cadv,logp,cost,
+               use_constraint=True,clip=0.2,epochs=6,bs=512,max_kl=0.02):
+
+    # getting batch size and device
+    N=ob.shape[0]; dev=DEVICE
+
+    # normalizing advantages
+    adv=(adv-adv.mean())/(adv.std()+1e-8)
+
+    # updating lagrangian multiplier
+    lam=pid.update(cost.mean()) if use_constraint else 0.0
+
+    # converting numpy arrays into tensors
+    ot=torch.tensor(ob,dtype=torch.float32,device=dev)
+    ibt=torch.tensor(ib,dtype=torch.float32,device=dev)
+    fst=torch.tensor(fs,dtype=torch.float32,device=dev)
+    at=torch.tensor(act,dtype=torch.float32,device=dev)
+    rt=torch.tensor(ret,dtype=torch.float32,device=dev)
+    adt=torch.tensor(adv,dtype=torch.float32,device=dev)
+    crt=torch.tensor(cret,dtype=torch.float32,device=dev)
+    cadt=torch.tensor(cadv,dtype=torch.float32,device=dev)
+    lpt=torch.tensor(logp,dtype=torch.float32,device=dev)
+
+    # running multiple ppo epochs
+    for ep in range(epochs):
+
+        # shuffling samples
+        idx=torch.randperm(N,device=dev); kls=0; nb=0
+
+        # making mini batches
+        for s in range(0,N,bs):
+
+            # selecting mini batch
+            mb=idx[s:s+bs]; dist,val,cval=policy(ot[mb],ibt[mb],fst[mb])
+
+            # calculating policy ratio
+            lp=dist.log_prob(at[mb]).sum(-1); ratio=(lp-lpt[mb]).exp()
+
+            # estimating kl divergence
+            with torch.no_grad(): kls+=abs(((ratio-1)-(lp-lpt[mb])).mean().item()); nb+=1
+
+            # calculating clipped surrogate objective
+            s1=ratio*adt[mb]; s2=torch.clamp(ratio,1-clip,1+clip)*adt[mb]
+
+            # calculating total ppo loss
+            loss=(-torch.min(s1,s2).mean()+0.5*(rt[mb]-val.squeeze()).pow(2).mean()
+                  +0.5*(crt[mb]-cval.squeeze()).pow(2).mean()-0.01*dist.entropy().sum(-1).mean())
+
+            # adding constraint penalty
+            if use_constraint: loss+=lam*(ratio*cadt[mb]).mean()
+
+            # doing gradient updating
+            opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(policy.parameters(),0.5); opt.step()
+
+        # stopping early if kl is large
+        if nb>0 and kls/nb>max_kl: break
+
+    # returning training statistics
+    return {"pi":loss.item(),"lam":lam,"viol":float(cost.mean())}
+
+def collect(env,policy,n_steps,action_clip=5.0):
+
+    # making rollout storage lists
+    ol,il,fl,al,rl,cl,dl,ll,vl,cvl=[],[],[],[],[],[],[],[],[],[]
+
+    # resetting environment
+    obs,ctx=env.reset()
+
+    # collecting rollout samples
+    for _ in range(n_steps):
+
+        # getting innovation buffer
+        ib=np.array(env.innovs,dtype=np.float32)
+
+        # getting filter statistics
+        fs=np.array([env.ekf.nees/6,env.ekf.nis/2,np.log1p(np.trace(env.ekf.P)),np.log1p(env.ekf.S[0,0])],dtype=np.float32)
+
+        # converting inputs into tensors
+        ot=torch.tensor(obs,dtype=torch.float32,device=DEVICE).unsqueeze(0)
+        ibt=torch.tensor(ib,dtype=torch.float32,device=DEVICE).unsqueeze(0)
+        fst=torch.tensor(fs,dtype=torch.float32,device=DEVICE).unsqueeze(0)
+
+        # sampling action from policy
+        a,lp,v,cv=policy.act(ot,ibt,fst); a=a.squeeze();lp=lp.squeeze();v=v.squeeze();cv=cv.squeeze()
+
+        # stepping environment with clipped action
+        nobs,nctx,rew,done,info=env.step(np.clip(a,-action_clip,action_clip))
+
+        # storing rollout data
+        ol.append(obs);il.append(ib);fl.append(fs);al.append(a);rl.append(rew)
+
+        # storing cost and value info
+        cl.append(0.0 if info["consistent"] else 1.0);dl.append(float(done));ll.append(lp);vl.append(v);cvl.append(cv)
+
+        # resetting or moving next state
+        obs,ctx=(env.reset() if done else (nobs,nctx))
+
+    # returning collected rollout arrays
+    return tuple(np.array(x) for x in [ol,il,fl,al,rl,cl,dl,ll,vl,cvl])
+
+def evaluate(env,policy,tasks,n_ep=5):
+
+    # storing evaluation results
+    results=[]
+
+    # running all evaluation tasks
+    for task in tasks:
+        for _ in range(n_ep):
+
+            # resetting environment with task
+            obs,ctx=env.reset(task=task); nl=[]; done=False
+
+            # running episode
+            while not done:
+
+                # getting innovation buffer
+                ib=np.array(env.innovs,dtype=np.float32)
+
+                # getting filter statistics
+                fs=np.array([env.ekf.nees/6,env.ekf.nis/2,np.log1p(np.trace(env.ekf.P)),np.log1p(env.ekf.S[0,0])],dtype=np.float32)
+
+                # converting inputs into tensors
+                ot=torch.tensor(obs,dtype=torch.float32,device=DEVICE).unsqueeze(0)
+                ibt=torch.tensor(ib,dtype=torch.float32,device=DEVICE).unsqueeze(0)
+                fst=torch.tensor(fs,dtype=torch.float32,device=DEVICE).unsqueeze(0)
+
+                # taking mean action for evaluation
+                with torch.no_grad(): d,_,_=policy(ot,ibt,fst); a=d.mean.squeeze().cpu().numpy()
+
+                # stepping environment
+                obs,ctx,_,done,info=env.step(np.clip(a,-5,5))
+
+                # storing nees values
+                nl.append(info["nees"])
+
+            # calculating episode metrics
+            na=np.array(nl); results.append({"nees":np.mean(na),"cons":float(np.mean((na>=1.237)&(na<=14.449))),"rmse":np.mean([info["rmse"]])})
+
+    # returning averaged evaluation metrics
+    return (np.mean([r["nees"] for r in results]),np.mean([r["cons"] for r in results]),
+            np.mean([r["rmse"] for r in results]))
