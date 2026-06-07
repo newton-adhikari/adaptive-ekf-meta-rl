@@ -1009,3 +1009,289 @@ def train_6d(encoder_type, use_constraint, label, seed, epochs, steps_per_epoch,
 
     # returning final result dictionary
     return result
+
+
+# ================================================================
+# Phase 0: 1D Feasibility Check
+# (Sanity check before scaling up to full EKF world)
+# ================================================================
+
+def run_phase0(seed, output_dir, log):
+    # entering the simplest sanity-check phase
+    log.info(f"\n{'='*65}\nPhase 0: 1D EKF Feasibility\n{'='*65}")
+
+    # fixing randomness so results don't randomly drift every run
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    # ------------------------------------------------------------
+    # tiny PPO model just for the 1D toy problem
+    # ------------------------------------------------------------
+    class PPO1D(nn.Module):
+
+        def __init__(self, od, ad, h=128):
+            super().__init__()
+
+            # compress observation into something useful
+            self.actor = nn.Sequential(
+                nn.Linear(od, h),
+                nn.Tanh(),
+                nn.Linear(h, h),
+                nn.Tanh()
+            )
+
+            # producing mean action + learned exploration scale
+            self.mean = nn.Linear(h, ad)
+            self.log_std = nn.Parameter(torch.zeros(ad) - 0.5)
+
+            # critic estimates value of current state
+            self.critic = nn.Sequential(
+                nn.Linear(od, h),
+                nn.Tanh(),
+                nn.Linear(h, h),
+                nn.Tanh(),
+                nn.Linear(h, 1),
+            )
+
+        def forward(self, o):
+            # run observation through network and return policy + value
+            h = self.actor(o)
+            dist = Normal(
+                self.mean(h),
+                self.log_std.exp().expand(o.shape[0], -1)
+            )
+            val = self.critic(o)
+            return dist, val
+
+        def act(self, o):
+            # sampling actions without tracking gradients (pure rollout mode)
+            with torch.no_grad():
+                dist, v = self.forward(o)
+                a = dist.sample()
+                lp = dist.log_prob(a).sum(-1)
+
+            # convert everything back to numpy for environment use
+            return a.numpy(), lp.numpy(), v.numpy()
+
+    # true system vs mismatched filter assumptions
+    Q_true = np.diag([0.01, 0.01])
+    R_true = np.array([[1.0]])
+
+    Q_nom = np.diag([1.0, 1.0])
+    R_nom = np.array([[0.01]])
+
+    # helper: run one full 1D EKF episode
+    def run_1d_ep(ekf, alpha_Q, alpha_R, ep_len=100):
+
+        # true state starts simple but slightly noisy
+        x_true = np.array([0.0, 1.0])
+
+        # filter starts with uncertainty in initial guess
+        x0 = x_true + np.random.randn(2) * 0.3
+        ekf.reset(x0, np.eye(2), Q_nom.copy(), R_nom.copy())
+
+        nees_log = []
+
+        for _ in range(ep_len):
+
+            # tuning EKF noise assumptions (this is what we will learn later)
+            ekf.Q = Q_nom * alpha_Q
+            ekf.R = R_nom * alpha_R
+
+            # propagate true system with process noise
+            x_true = ekf.F @ x_true + np.random.multivariate_normal([0, 0], Q_true)
+
+            # noisy measurement of position only
+            z = (ekf.H @ x_true) + np.array([np.random.normal(0, 1.0)])
+
+            # EKF predict-update cycle
+            ekf.predict()
+            ekf.update(z)
+
+            # consistency check metric
+            nees_log.append(ekf.nees(x_true))
+
+        # summarizing episode performance
+        na = np.array(nees_log)
+
+        return np.mean(na), float(np.mean((na >= 0.051) & (na <= 7.378)))
+
+    # baseline EKF evaluation (bad assumptions on purpose)
+    ekf = EKF1D()
+
+    bl_n, bl_c = np.mean(
+        [run_1d_ep(ekf, 1, 1) for _ in range(50)],
+        axis=0
+    )
+
+    log.info(f"Baseline (wrong Q/R): NEES={bl_n:.2f} Cons={bl_c:.1%}")
+
+    # pretending we know correct noise
+    or_n, or_c = np.mean(
+        [run_1d_ep(ekf, 0.01, 100) for _ in range(50)],
+        axis=0
+    )
+
+    log.info(f"Oracle (true Q/R):    NEES={or_n:.2f} Cons={or_c:.1%}")
+
+    # learning policy that tunes Q/R scaling online
+    policy = PPO1D(13, 2)
+    opt = torch.optim.Adam(policy.parameters(), lr=3e-4)
+
+    best_c = 0
+
+    # ------------------------------------------------------------
+    # main training loop
+    # ------------------------------------------------------------
+    for it in range(1, 1001):
+
+        # storage for rollout
+        obs_buf, act_buf, rew_buf, done_buf, lp_buf, val_buf = [], [], [], [], [], []
+
+        # reset simulation
+        x_true = np.array([0.0, 1.0])
+        ekf.reset(
+            x_true + np.random.randn(2) * 0.3,
+            np.eye(2),
+            Q_nom.copy(),
+            R_nom.copy()
+        )
+
+        innovs = [0.0] * 5
+        last_nees = 0
+        step = 0
+
+        # --------------------------------------------------------
+        # collect trajectory
+        # --------------------------------------------------------
+        for _ in range(800):
+
+            # building observation vector (innovation + EKF stats)
+            obs = np.concatenate([
+                innovs,
+                [
+                    last_nees / 5,
+                    np.log1p(np.trace(ekf.P)),
+                    0, 0, 0, 0, 0, 0
+                ]
+            ]).astype(np.float32)[:13]
+
+            ot = torch.tensor(obs).unsqueeze(0)
+
+            # policy decision
+            a, lp, v = policy.act(ot)
+            a = a.squeeze()
+            lp = lp.squeeze()
+            v = v.squeeze()
+
+            # converting policy output into noise scaling factors
+            alpha = np.clip(np.exp(a), 0.01, 100)
+
+            # injecting adaptation into EKF
+            ekf.Q = Q_nom * alpha[0]
+            ekf.R = R_nom * alpha[1]
+
+            # system evolution
+            x_true = ekf.F @ x_true + np.random.multivariate_normal([0, 0], Q_true)
+            z = (ekf.H @ x_true) + np.array([np.random.normal(0, 1)])
+
+            # EKF update
+            ekf.predict()
+            nu, S = ekf.update(z)
+
+            nees = ekf.nees(x_true)
+
+            # update short-term memory
+            innovs.append(nu)
+            innovs = innovs[-5:]
+            last_nees = nees
+
+            # reward shaped around consistency + tracking error
+            reward = -np.log1p(abs(nees - 2)) \
+                     - 0.1 * min(float(np.sqrt(np.mean((x_true - ekf.x) ** 2))), 10)
+
+            # bonus if EKF stays statistically consistent
+            if 0.051 <= nees <= 7.378:
+                reward += 0.5
+
+            step += 1
+            done = step % 100 == 0
+
+            # storing transition
+            obs_buf.append(obs)
+            act_buf.append(a)
+            rew_buf.append(reward)
+            done_buf.append(float(done))
+            lp_buf.append(lp)
+            val_buf.append(v)
+
+            # reset sub-episode
+            if done:
+                x_true = np.array([0.0, 1.0])
+                ekf.reset(
+                    x_true + np.random.randn(2) * 0.3,
+                    np.eye(2),
+                    Q_nom.copy(),
+                    R_nom.copy()
+                )
+                innovs = [0.0] * 5
+                last_nees = 0
+                step = 0
+
+        # advantage estimation (GAE-style)
+        T = len(rew_buf)
+        adv = np.zeros(T)
+        lg = 0
+
+        for t in reversed(range(T)):
+            nv = val_buf[t + 1] if t + 1 < T else 0
+            delta = rew_buf[t] + 0.99 * nv * (1 - done_buf[t]) - val_buf[t]
+            adv[t] = lg = delta + 0.99 * 0.95 * (1 - done_buf[t]) * lg
+
+        ret = adv + np.array(val_buf)
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+        # PPO update
+        for _ in range(6):
+            idx = np.random.permutation(T)
+
+            for s in range(0, T, 128):
+                mb = idx[s:s + 128]
+
+                o = torch.tensor(np.array(obs_buf)[mb], dtype=torch.float32)
+                ac = torch.tensor(np.array(act_buf)[mb], dtype=torch.float32)
+                r = torch.tensor(ret[mb], dtype=torch.float32)
+                ad = torch.tensor(adv[mb], dtype=torch.float32)
+                olp = torch.tensor(np.array(lp_buf)[mb], dtype=torch.float32)
+
+                dist, val = policy(o)
+                lp = dist.log_prob(ac).sum(-1)
+                ratio = (lp - olp).exp()
+
+                loss = (
+                    -torch.min(
+                        ratio * ad,
+                        torch.clamp(ratio, 0.8, 1.2) * ad
+                    ).mean()
+                    + 0.5 * (r - val.squeeze()).pow(2).mean()
+                    - 0.01 * dist.entropy().sum(-1).mean()
+                )
+
+                opt.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
+                opt.step()
+
+        # periodic progress check
+        if it % 200 == 0:
+            log.info(f"  Iter {it}: training...")
+
+    log.info("Phase 0 complete.")
+
+    return {
+        "phase": "0",
+        "baseline_nees": bl_n,
+        "baseline_cons": bl_c,
+        "oracle_nees": or_n,
+        "oracle_cons": or_c,
+    }
