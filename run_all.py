@@ -846,7 +846,7 @@ def evaluate(env,policy,tasks,n_ep=5):
                 with torch.no_grad(): d,_,_=policy(ot,ibt,fst); a=d.mean.squeeze().cpu().numpy()
 
                 # stepping environment
-                obs,ctx,_,done,info=env.step(np.clip(a,-5,5))
+                obs,ctx,_,done,info=env.step(np.clip(a,-2,2))
 
                 # storing nees values
                 nl.append(info["nees"])
@@ -939,8 +939,9 @@ def train_6d(encoder_type, use_constraint, label, seed, epochs, steps_per_epoch,
         # changing environment randomness each epoch
         env.rng=np.random.default_rng(seed+ep)
 
-        # using smaller action range during warmup for avoiding divergence
-        act_clip = 2.0 if ep <= 200 else 5.0
+        # Conservative action clipping throughout training to prevent EKF divergence
+        # Alpha range: [exp(-2), exp(2)] = [0.13, 7.4] — sufficient for adaptation
+        act_clip = 2.0
 
         # collecting rollout samples
         ob,ib,fs,ab,rb,cb,db,lpb,vb,cvb=collect(env,policy,steps_per_epoch,action_clip=act_clip)
