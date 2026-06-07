@@ -1733,3 +1733,104 @@ def run_comparison(policy_ckpt, seed, output_dir, log):
 
     return results
 
+
+# ================================================================
+# Main Method, the action starts::::::
+# ================================================================
+
+ABLATION_VARIANTS = [
+    ("mlp",   False, "MLP + No Constraint"),
+    ("mlp",   True,  "MLP + PID-CCPO"),
+    ("stsie", False, "ST-SIE + No Constraint"),
+    ("stsie", True,  "ST-SIE + PID-CCPO (Full)"),
+]
+
+def main():
+    parser = argparse.ArgumentParser(description="CC-MetaEKF: One-command pipeline")
+    parser.add_argument("--phase", type=str, default="all",
+                        choices=["all","0","03","1","ablation","comparison"],
+                        help="Which phase to run")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--epochs", type=int, default=0, help="0=auto based on device")
+    parser.add_argument("--steps", type=int, default=0, help="0=auto based on device")
+    args = parser.parse_args()
+
+    # Auto-tune for hardware
+    if args.epochs == 0:
+        args.epochs = 2000 if DEVICE == "cuda" else 800
+    if args.steps == 0:
+        args.steps = 4800 if DEVICE == "cuda" else 2400
+
+    output_dir = Path("results") / f"run_s{args.seed}"
+    log, log_file = setup_logging(output_dir)
+
+    log.info("=" * 65)
+    log.info("CC-MetaEKF: Complete Training")
+    log.info(f"Device: {DEVICE_NAME}")
+    log.info(f"Phase: {args.phase} | Seed: {args.seed}")
+    log.info(f"Epochs: {args.epochs} | Steps/epoch: {args.steps}")
+    log.info(f"Output: {output_dir}")
+    log.info(f"Log: {log_file}")
+    log.info("=" * 65)
+
+    all_results = {}
+
+    # Phase 0
+    if args.phase in ["all", "0"]:
+        r = run_phase0(args.seed, output_dir, log)
+        all_results["phase0"] = r
+        log_and_save(r, "phase0", output_dir)
+
+    # Phase 1: Single best variant
+    if args.phase in ["all", "1"]:
+        r = train_6d("stsie", True, "CC-MetaEKF (ST-SIE + PID-CCPO)",
+                      args.seed, args.epochs, args.steps, output_dir, log)
+        all_results["phase1"] = r
+        log_and_save(r, "phase1_full", output_dir)
+
+    # Ablation matrix
+    if args.phase in ["all", "ablation"]:
+        log.info(f"\n{'='*65}\nAblation Matrix (4 variants)\n{'='*65}")
+        ablation_results = {}
+        for enc, cons, label in ABLATION_VARIANTS:
+            r = train_6d(enc, cons, label, args.seed, args.epochs, args.steps, output_dir, log)
+            key = f"{enc}_{'pid' if cons else 'none'}"
+            ablation_results[key] = r
+            log_and_save(r, f"ablation_{key}", output_dir)
+
+        # Print matrix
+        log.info(f"\n{'='*65}")
+        log.info("ABLATION MATRIX")
+        log.info(f"{'='*65}")
+        log.info(f"{'':>20} {'No Constraint':>18} {'PID-CCPO':>18}")
+        log.info("-" * 58)
+        for enc_name, enc_key in [("MLP", "mlp"), ("ST-SIE", "stsie")]:
+            nc = ablation_results.get(f"{enc_key}_none", {})
+            pc = ablation_results.get(f"{enc_key}_pid" if enc_key=="mlp" else "stsie_pid", {})
+            if enc_key == "stsie": pc = ablation_results.get("stsie_pid", {})
+            nc_s = f"C={nc.get('best_cons',0):.1%}" if nc else "--"
+            pc_s = f"C={pc.get('best_cons',0):.1%}" if pc else "--"
+            log.info(f"{enc_name:>20} {nc_s:>18} {pc_s:>18}")
+        log.info(f"{'='*65}")
+        all_results["ablation"] = ablation_results
+
+    # Comparison
+    if args.phase in ["all", "comparison"]:
+        ckpt = output_dir / "best_stsie_pid_s{}.pt".format(args.seed)
+        if not ckpt.exists():
+            ckpt = Path("checkpoints/best_6d.pt")
+        r = run_comparison(str(ckpt) if ckpt.exists() else None, args.seed, output_dir, log)
+        all_results["comparison"] = r
+
+    # Final summary
+    log.info(f"\n{'='*65}")
+    log.info("ALL DONE")
+    log.info(f"Results saved to: {output_dir}")
+    log.info(f"Log file: {log_file}")
+    log.info(f"{'='*65}")
+
+    log_and_save(all_results, "all_results", output_dir)
+
+
+if __name__ == "__main__":
+    main()
