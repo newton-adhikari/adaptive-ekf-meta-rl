@@ -7,4 +7,4 @@ runs/
 notebooks/.ipynb_checkpoints/
 results/
 checkpoints/
- 
+*.log
