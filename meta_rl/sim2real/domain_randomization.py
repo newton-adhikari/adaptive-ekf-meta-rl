@@ -34,3 +34,15 @@ class DomainRandomizationConfig:
     # Environment perturbations
     terrain_roughness_range: tuple[float, float] = (0.0, 0.05)  # m
 
+
+
+class CalibratedDomainRandomizer:
+    """
+    Generates randomized simulation parameters according to real data.
+
+    """
+
+    def __init__(
+        self
+    ):
+        pass
