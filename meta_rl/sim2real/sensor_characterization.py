@@ -75,3 +75,59 @@ def compute_allan_variance(
         bias_instability=bias_instability, rrw=rrw,
     )
 
+
+def fit_range_noise_model(
+    ranges: np.ndarray, noise_std: np.ndarray
+) -> tuple[float, float, float]:
+    """
+    Fit range-dependent noise model: σ(d) = a + b*d + c*d².
+    """
+    # Fit quadratic: σ = a + b*d + c*d²
+    coeffs = np.polyfit(ranges, noise_std, deg=2)
+    c, b, a = coeffs
+    return float(a), float(b), float(c)
+
+
+def estimate_process_noise(
+    ground_truth: np.ndarray,
+    odometry: np.ndarray,
+    dt: float = 0.1,
+) -> np.ndarray:
+    """
+    Estimate process noise Q from ground truth vs odometry.
+
+    This will return:: Q_estimated: (n_x, n_x) estimated process noise covariance.
+    """
+    # Prediction residuals
+    residuals = ground_truth[1:] - odometry[:-1]
+
+    # Handle angle wrapping for heading (assumed at index 2)
+    if residuals.shape[1] > 2:
+        residuals[:, 2] = (residuals[:, 2] + np.pi) % (2 * np.pi) - np.pi
+
+    Q = np.cov(residuals.T)
+    return Q
+
+
+def characterize_lidar_static(
+    scan_data: np.ndarray, known_distances: Optional[np.ndarray] = None
+) -> dict:
+    """
+    Characterize LiDAR noise from static measurements.
+    """
+    mean_ranges = np.mean(scan_data, axis=0)
+    std_ranges = np.std(scan_data, axis=0)
+
+    result = {
+        "mean_ranges": mean_ranges,
+        "std_ranges": std_ranges,
+        "avg_noise_std": float(np.mean(std_ranges)),
+        "max_noise_std": float(np.max(std_ranges)),
+    }
+
+    if known_distances is not None:
+        bias = mean_ranges - known_distances
+        result["bias"] = bias
+        result["avg_bias"] = float(np.mean(np.abs(bias)))
+
+    return result
