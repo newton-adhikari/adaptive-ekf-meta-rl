@@ -1,1 +1,75 @@
-<! -- outdoor_rough.world -->
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <world name="outdoor_rough">
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <!-- Outdoor rough terrain: uneven surface, sparse features -->
+    <!-- Heightmap for rough terrain -->
+    <model name="rough_terrain">
+      <static>true</static>
+      <pose>0 0 0 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>20 20 0.01</size></box>
+          </geometry>
+          <surface>
+            <friction>
+              <ode>
+                <mu>1.5</mu>
+                <mu2>1.5</mu2>
+              </ode>
+            </friction>
+          </surface>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>20 20 0.01</size></box>
+          </geometry>
+          <material>
+            <ambient>0.4 0.35 0.25 1</ambient>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Sparse obstacles (rocks, bushes) -->
+    <model name="rock1">
+      <static>true</static>
+      <pose>3 2 0.15 0 0 0.5</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><sphere><radius>0.3</radius></sphere></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><sphere><radius>0.3</radius></sphere></geometry>
+          <material><ambient>0.5 0.5 0.5 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="rock2">
+      <static>true</static>
+      <pose>-2 4 0.1 0 0 1.2</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><sphere><radius>0.2</radius></sphere></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><sphere><radius>0.2</radius></sphere></geometry>
+          <material><ambient>0.5 0.5 0.5 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <physics type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1</real_time_factor>
+    </physics>
+  </world>
+</sdf>
