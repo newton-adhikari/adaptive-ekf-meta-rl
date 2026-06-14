@@ -44,7 +44,7 @@ class SpectralCNN(nn.Module):
 class FilterStateEncoder(nn.Module):
     """This encodes filter diagnostics (NEES, NIS, tr(P), diag(S)) into tokens."""
 
-    def __init__():
+    def __init__(self, filter_state_dim: int, embed_dim: int):
         super().__init__()
         self.fc = nn.Sequential(
             nn.Linear(filter_state_dim, embed_dim),
@@ -69,7 +69,14 @@ class STSIEEncoder(nn.Module):
     """
 
     def __init__(
-        self
+        self,
+        innovation_dim: int = 2,
+        filter_state_dim: int = 5,  # NEES + NIS + tr(P) + diag(S)[2]
+        window_size: int = 32,
+        hop_size: int = 8,
+        latent_dim: int = 32,
+        n_heads: int = 4,
+        cnn_hidden: int = 32,
     ):
         super().__init__()
         self.innovation_dim = innovation_dim
