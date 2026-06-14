@@ -5,6 +5,7 @@ which runs the trained meta-RL policy for real-time EKF noise adaptation.
 """
 
 import numpy as np
+import os
 
 try:
     import torch
@@ -78,28 +79,32 @@ if ROS2_AVAILABLE:
             )
 
         def _load_models(self, ckpt_path, state_dim, meas_dim):
-            """Load encoder and policy from checkpoint."""
-            latent_dim = 32
-            filter_state_dim = 1 + 1 + 1 + meas_dim
+            """Load trained policy from checkpoint (run_all.py format).
 
-            self.encoder = STSIEEncoder(
-                innovation_dim=meas_dim,
-                filter_state_dim=filter_state_dim,
-                latent_dim=latent_dim,
-            ).eval()
+            The checkpoint from run_all.py saves the full Policy model state_dict
+            which includes encoder + actor + critic as one unified model.
+            """
+            # Import the same model architecture used in training
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))))
+            from run_all import STSIEEncoder as TrainEncoder, Policy as TrainPolicy, MLPEncoder
 
-            obs_dim = self.innov_window_size * meas_dim + 1 + 1 + 1 + meas_dim
-            self.policy = GaussianPolicy(
-                state_dim=obs_dim,
-                context_dim=latent_dim,
-                action_dim=state_dim + meas_dim,
-            ).eval()
+            # Reconstruct model with same architecture as training
+            # obs_dim matches Env6D: 5*2 + 1 + 1 + 1 + 6 + 6 + 2 = 25
+            obs_dim = 5 * meas_dim + 1 + 1 + 1 + state_dim + state_dim + meas_dim
+            act_dim = state_dim + meas_dim  # 8 for 6D state + 2D meas
+            ctx_len = 30  # innovation buffer length
+
+            enc = TrainEncoder(meas_dim, 4, 32, 16, 4)
+            self.full_policy = TrainPolicy(obs_dim, act_dim, enc).eval()
 
             try:
-                ckpt = torch.load(ckpt_path, map_location="cpu")
-                self.encoder.load_state_dict(ckpt["encoder"])
-                self.policy.load_state_dict(ckpt["policy"])
+                ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+                self.full_policy.load_state_dict(ckpt)
                 self.get_logger().info(f"Loaded checkpoint: {ckpt_path}")
+            except Exception as e:
+                self.get_logger().warn(f"Checkpoint load failed: {e}. Using random weights.")
             except FileNotFoundError:
                 self.get_logger().warn(
                     f"Checkpoint not found: {ckpt_path}. Using random weights."
@@ -207,3 +212,4 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
+ 
