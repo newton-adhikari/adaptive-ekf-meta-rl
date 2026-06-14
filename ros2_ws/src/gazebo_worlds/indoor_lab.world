@@ -1,0 +1,101 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <world name="indoor_lab">
+    <!-- Ground plane -->
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+
+    <!-- Sun -->
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <!-- Indoor lab: structured environment with flat floor -->
+    <!-- Walls -->
+    <model name="wall_north">
+      <static>true</static>
+      <pose>0 5 1 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>10 0.2 2</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>10 0.2 2</size></box></geometry>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_south">
+      <static>true</static>
+      <pose>0 -5 1 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>10 0.2 2</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>10 0.2 2</size></box></geometry>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_east">
+      <static>true</static>
+      <pose>5 0 1 0 0 1.5708</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>10 0.2 2</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>10 0.2 2</size></box></geometry>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_west">
+      <static>true</static>
+      <pose>-5 0 1 0 0 1.5708</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>10 0.2 2</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>10 0.2 2</size></box></geometry>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Obstacles (tables, shelves) -->
+    <model name="table1">
+      <static>true</static>
+      <pose>2 2 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>1.2 0.6 0.8</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>1.2 0.6 0.8</size></box></geometry>
+        </visual>
+      </link>
+    </model>
+
+    <model name="shelf1">
+      <static>true</static>
+      <pose>-3 1 1 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.4 2 2</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.4 2 2</size></box></geometry>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Physics -->
+    <physics type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1</real_time_factor>
+    </physics>
+  </world>
+</sdf>

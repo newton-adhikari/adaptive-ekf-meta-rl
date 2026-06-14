@@ -136,45 +136,63 @@ if ROS2_AVAILABLE:
             self._publish_diagnostics()
 
         def _update_context(self):
-            """Slow loop: recompute context z from innovation buffer."""
-            innov_window = self.ekf.get_innovation_window(self.innov_window_size)
-            filter_state = np.array([
-                self.ekf.state.nees, self.ekf.state.nis,
-                np.trace(self.ekf.state.P), *np.diag(self.ekf.state.S),
-            ])
-
-            with torch.no_grad():
-                iw = torch.tensor(innov_window, dtype=torch.float32).unsqueeze(0)
-                fs = torch.tensor(filter_state, dtype=torch.float32).unsqueeze(0)
-                self._cached_z = self.encoder(iw, fs)
+            """Slow loop: recompute context (handled internally by full_policy encoder)."""
+            # With the unified policy from run_all.py, the encoder runs as part of forward()
+            # No separate context caching needed — just track innovation buffer
+            pass
 
         def _adapt_noise(self):
-            """Fast loop: run policy with cached context."""
+            """Fast loop: run trained policy to adapt Q/R."""
+            # Build observation matching training format (from run_all.py Env6D._obs())
             innov_window = self.ekf.get_innovation_window(self.innov_window_size)
-            filter_state = np.array([
-                self.ekf.state.nees, self.ekf.state.nis,
-                np.trace(self.ekf.state.P), *np.diag(self.ekf.state.S),
-            ])
+            n_innov = 5
+            recent_innovs = innov_window[-n_innov:] if len(innov_window) >= n_innov else innov_window
 
-            obs = np.concatenate([
-                innov_window.flatten(),
-                [self.ekf.state.nees, self.ekf.state.nis,
-                 np.trace(self.ekf.state.P)],
-                np.diag(self.ekf.state.S),
-            ])
+            # Observation: [last 5 innovations flat, nees/6, nis/2, log(tr(P)), log(diag(P)), log(diag(Q)), log(diag(R))]
+            iv = np.array(recent_innovs).flatten()
+            if len(iv) < n_innov * self.ekf.m:
+                iv = np.pad(iv, (0, n_innov * self.ekf.m - len(iv)))
+
+            obs = np.clip(np.concatenate([
+                iv,
+                [self.ekf.state.nees / 6.0, self.ekf.state.nis / 2.0,
+                 np.log1p(max(np.trace(self.ekf.state.P), 0))],
+                np.log1p(np.maximum(np.diag(self.ekf.state.P), 0)),
+                np.log1p(np.maximum(np.diag(self.ekf.state.Q), 0)),
+                np.log1p(np.maximum(np.diag(self.ekf.state.R), 0)),
+            ]), -20, 20).astype(np.float32)
+
+            # Innovation buffer for encoder
+            ib = np.array(innov_window[-30:] if len(innov_window) >= 30
+                          else [[0.0]*self.ekf.m]*30, dtype=np.float32)
+
+            # Filter state for encoder
+            fs = np.array([
+                self.ekf.state.nees / 6.0, self.ekf.state.nis / 2.0,
+                np.log1p(np.trace(self.ekf.state.P)),
+                np.log1p(self.ekf.state.S[0, 0] if self.ekf.state.S.shape[0] > 0 else 1.0),
+            ], dtype=np.float32)
 
             with torch.no_grad():
-                s = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
-                action = self.policy.deterministic(s, self._cached_z)
-                action = action.numpy().squeeze(0)
+                ot = torch.tensor(obs).unsqueeze(0)
+                ibt = torch.tensor(ib).unsqueeze(0)
+                fst = torch.tensor(fs).unsqueeze(0)
+                dist, _, _ = self.full_policy(ot, ibt, fst)
+                action = dist.mean.squeeze(0).numpy()
 
-            # Apply action
+            # Apply action (clip to [-2, 2] matching training)
+            action = np.clip(action, -2.0, 2.0)
+            alphas = np.exp(action)
+
             n_q = self.ekf.n
-            Q_scales = np.clip(action[:n_q], 0.1, 10.0)
-            R_scales = np.clip(action[n_q:], 0.1, 10.0)
+            Q_scales = alphas[:n_q]
+            R_scales = alphas[n_q:]
 
-            Q_new = np.diag(Q_scales) @ self.ekf.state.Q
-            R_new = np.diag(R_scales) @ self.ekf.state.R
+            Q_nom = np.eye(n_q) * 0.05  # nominal from training
+            R_nom = np.eye(self.ekf.m) * 0.5
+
+            Q_new = np.diag(Q_scales) @ Q_nom
+            R_new = np.diag(R_scales) @ R_nom
             self.ekf.set_noise(Q_new, R_new)
 
         def _publish_state(self, header):
