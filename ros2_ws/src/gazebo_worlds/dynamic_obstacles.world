@@ -1,0 +1,90 @@
+<!-- dynamic_obstacles world -->
+
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <world name="dynamic_obstacles">
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <!-- Dynamic obstacles world: moving objects -->
+    <!-- Walls (enclosed area) -->
+    <model name="wall_north">
+      <static>true</static>
+      <pose>0 8 1 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>16 0.2 2</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>16 0.2 2</size></box></geometry>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_south">
+      <static>true</static>
+      <pose>0 -8 1 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>16 0.2 2</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>16 0.2 2</size></box></geometry>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Moving obstacle (box on a rail) -->
+    <model name="moving_box">
+      <pose>3 0 0.5 0 0 0</pose>
+      <link name="link">
+        <inertial>
+          <mass>5.0</mass>
+        </inertial>
+        <collision name="collision">
+          <geometry><box><size>0.5 0.5 1.0</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.5 0.5 1.0</size></box></geometry>
+          <material><ambient>0.8 0.2 0.2 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Static pillars for LiDAR reference -->
+    <model name="pillar1">
+      <static>true</static>
+      <pose>-4 3 0.75 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><cylinder><radius>0.15</radius><length>1.5</length></cylinder></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.15</radius><length>1.5</length></cylinder></geometry>
+        </visual>
+      </link>
+    </model>
+
+    <model name="pillar2">
+      <static>true</static>
+      <pose>4 -3 0.75 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><cylinder><radius>0.15</radius><length>1.5</length></cylinder></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.15</radius><length>1.5</length></cylinder></geometry>
+        </visual>
+      </link>
+    </model>
+
+    <physics type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1</real_time_factor>
+    </physics>
+  </world>
+</sdf>
