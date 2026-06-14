@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'ekf_node'
+package_name = 'meta_ekf_node'
 
 setup(
     name=package_name,
@@ -14,7 +14,7 @@ setup(
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='toor',
-    maintainer_email='newton@example.com',
+    maintainer_email='newton@example',
     description='TODO: Package description',
     license='TODO: License declaration',
     extras_require={
