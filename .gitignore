@@ -9,3 +9,6 @@ results/
 checkpoints/
 *.log
 *.zip
+build/
+install/
+log/

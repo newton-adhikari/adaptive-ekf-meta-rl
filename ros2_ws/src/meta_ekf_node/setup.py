@@ -14,7 +14,7 @@ setup(
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='toor',
-    maintainer_email='newton@example',
+    maintainer_email='newton@example.com',
     description='TODO: Package description',
     license='TODO: License declaration',
     extras_require={

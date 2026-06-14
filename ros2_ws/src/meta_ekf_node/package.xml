@@ -4,7 +4,7 @@
   <name>meta_ekf_node</name>
   <version>0.0.0</version>
   <description>TODO: Package description</description>
-  <maintainer email="newton@example">toor</maintainer>
+  <maintainer email="newton@example.com">toor</maintainer>
   <license>TODO: License declaration</license>
 
   <depend>rclpy</depend>
