@@ -5,6 +5,7 @@ by comparing EKF output against ground truth.
 """
 
 import numpy as np
+import json
 
 try:
     import rclpy
