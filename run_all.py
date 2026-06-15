@@ -1432,30 +1432,19 @@ def run_comparison(policy_ckpt, seed, output_dir, log):
 
         def adapt(nu, P, S, H, K=None):
             step[0] += 1
+            nonlocal R
 
-            # slowly decreasing learning rate (bias-corrected EMA)
-            dk = (1 - b) / (1 - b**step[0]) if step[0] < 200 else (1 - b)
-
-            nonlocal Q, R
+            # Bug fix: stable learning-rate schedule
+            dk = min(1.0 - b, 1.0 / step[0])
 
             # innovation-based covariance estimate
             R_innov = np.outer(nu, nu) - H @ P @ H.T
-            R = (1 - dk) * R + dk * R_innov
+            R_new = (1 - dk) * R + dk * R_innov
 
             # keeping R numerically safe (PSD projection from eigenvalues)
-            ev, evec = np.linalg.eigh(R)
+            ev, evec = np.linalg.eigh(R_new)
             ev = np.maximum(ev, 1e-4)
             R = evec @ np.diag(ev) @ evec.T
-
-            # same idea for Q (state-driven update)
-            if K is not None:
-                res = K @ nu
-                Q_innov = np.outer(res, res)
-                Q = (1 - dk) * Q + dk * Q_innov
-
-                ev, evec = np.linalg.eigh(Q)
-                ev = np.maximum(ev, 1e-4)
-                Q = evec @ np.diag(ev) @ evec.T
 
             return Q, R
 

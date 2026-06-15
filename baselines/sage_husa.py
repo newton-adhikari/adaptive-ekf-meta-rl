@@ -4,57 +4,70 @@ Exponential moving average of innovation outer product to estimate R,
 and residual-based estimation for Q.
 """
 
+import numpy as np
+
+
 class SageHusaAdapter:
     """Sage-Husa (1969) adaptive noise estimation.
 
-    This assumes stationary noisem diverges under abrupt changes.
+    Fix: We estimates R online from innovation statistics.
+    Q is kept at nominal (not adapted) for stability.
+
     """
 
     def __init__(
         self,
         Q_init: np.ndarray,
         R_init: np.ndarray,
-        forgetting_factor: float = 0.98,
+        forgetting_factor: float = 0.995,
+        min_eigenvalue: float = 1e-4,
     ):
+        # here we, have kept fixed Q — joint adaptation diverges
         self.Q = Q_init.copy()
         self.R = R_init.copy()
         self.b = forgetting_factor
+        self.min_ev = min_eigenvalue
         self._step = 0
 
     def adapt(
         self,
         innovation: np.ndarray,
         P: np.ndarray,
-        S: np.ndarray,
-        H: np.ndarray = None,
-        F: np.ndarray = None,
-        K: np.ndarray = None,
-        x_pred: np.ndarray = None,
-        x_updated: np.ndarray = None,
+        H: np.ndarray,
         **kwargs,
     ) -> tuple[np.ndarray, np.ndarray]:
         self._step += 1
-        d_k = 1.0 - self.b if self._step > 1 else 1.0
 
-        # for R estimation: R_k = (1-d_k)*R_{k-1} + d_k*(ν_k ν_k^T - H P H^T)
-        nu_outer = np.outer(innovation, innovation)
-        if H is not None:
-            R_innov = nu_outer - H @ P @ H.T
-        else:
-            R_innov = nu_outer - S + self.R
-        self.R = (1 - d_k) * self.R + d_k * R_innov
+        # Learning rate: transitions from averaging (1/step) to EMA (1-b)
+        # Step 1: dk=1.0 (full weight to first observation)
+        # Step 2: dk=0.5
+        # ...
+        # Step 200+: dk=0.005 (steady-state exponential)
+        dk = min(1.0 - self.b, 1.0 / self._step)
 
-        # to ensure R stays positive definite
-        self.R = np.maximum(self.R, np.eye(self.R.shape[0]) * 1e-6)
+        # E[ν*νᵀ] = H*P_k|k-1*Hᵀ + R  →  R ≈ ν*νᵀ - H*P*Hᵀ
+        # storing the predicted covariance separately.
+        R_innov = np.outer(innovation, innovation) - H @ P @ H.T
 
-        # for Q estimation via residual
-        if K is not None and F is not None:
-            residual = K @ innovation
-            q_outer = np.outer(residual, residual)
-            self.Q = (1 - d_k) * self.Q + d_k * q_outer
-            self.Q = np.maximum(self.Q, np.eye(self.Q.shape[0]) * 1e-6)
+        # Exponential moving average update
+        R_new = (1 - dk) * self.R + dk * R_innov
+
+        ev, evec = np.linalg.eigh(R_new)
+        ev = np.maximum(ev, self.min_ev)
+        self.R = evec @ np.diag(ev) @ evec.T
 
         return self.Q, self.R
 
     def reset(self):
+        """Reset step counter (e.g., at episode boundaries)."""
         self._step = 0
+
+    def get_params(self) -> dict:
+        """Return current noise estimates for logging."""
+        return {
+            "Q_diag": np.diag(self.Q).tolist(),
+            "R_diag": np.diag(self.R).tolist(),
+            "step": self._step,
+            "dk": min(1.0 - self.b, 1.0 / max(self._step, 1)),
+        }
+ 
