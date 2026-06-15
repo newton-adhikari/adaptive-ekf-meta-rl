@@ -272,7 +272,9 @@ def run_episode_window(positions, headings, velocities, omega, controls, dt,
 
     innovs = [[0.0, 0.0]] * CTX_LEN
     nees_list = []
-    b = 0.98  # Sage-Husa forgetting factor
+    b = 0.995  # Conservative forgetting factor fix from PR #18)
+    sage_step = 0
+ 
 
     for i in range(i0 + 1, end_idx):
         x_true = np.array([
@@ -314,17 +316,20 @@ def run_episode_window(positions, headings, velocities, omega, controls, dt,
         # --- EKF update ---
         nu = ekf.update(z)
 
-        # --- Sage-Husa adaptation (after update) ---
+        # Matches fixed implementation from PR #18:
+        # R-only, conservative dk, eigendecomposition
         if method == "sage_husa":
-            dk = 1 - b
+            sage_step += 1
+            dk = min(1.0 - b, 1.0 / sage_step)
             H = np.zeros((2, 6))
             H[0, 0] = 1
             H[1, 1] = 1
             R_innov = np.outer(nu, nu) - H @ ekf.P @ H.T
-            ekf.R = (1 - dk) * ekf.R + dk * R_innov
-            ev = np.linalg.eigvalsh(ekf.R)
-            if np.any(ev < 1e-6):
-                ekf.R += np.eye(2) * (abs(min(ev.min(), 0)) + 1e-4)
+            R_new = (1 - dk) * ekf.R + dk * R_innov
+            ev, evec = np.linalg.eigh(R_new)
+            ev = np.maximum(ev, 1e-4)
+            ekf.R = evec @ np.diag(ev) @ evec.T
+ 
 
         # --- finally commputing NEES ---
         nees = ekf.compute_nees(x_true)
