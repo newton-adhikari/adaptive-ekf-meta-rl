@@ -28,11 +28,15 @@ if ROS2_AVAILABLE:
 
             self.declare_parameter("state_dim", 6)
             self.declare_parameter("ekf_topic", "/meta_ekf/state")
-            self.declare_parameter("gt_topic", "/ground_truth/odom")
+            self.declare_parameter("gt_topic", "/odom")
+            self.declare_parameter("output_file", "")
+            self.declare_parameter("method_name", "unknown")
 
             state_dim = self.get_parameter("state_dim").value
             ekf_topic = self.get_parameter("ekf_topic").value
             gt_topic = self.get_parameter("gt_topic").value
+            self.output_file = self.get_parameter("output_file").value
+            self.method_name = self.get_parameter("method_name").value
 
             self.state_dim = state_dim
             self.chi2_lb, self.chi2_ub = chi2_bounds(state_dim)
@@ -40,6 +44,7 @@ if ROS2_AVAILABLE:
             self._latest_ekf = None
             self._latest_gt = None
             self._nees_history = []
+            self._rmse_history = []
 
             self.create_subscription(
                 PoseWithCovarianceStamped, ekf_topic, self._ekf_cb, 10
@@ -71,8 +76,16 @@ if ROS2_AVAILABLE:
             ekf_pos = self._latest_ekf.pose.pose
             x_est = np.array([ekf_pos.position.x, ekf_pos.position.y])
 
+            # pose.covariance is 6x6 row-major; extract 2x2 position block
             cov_flat = np.array(self._latest_ekf.pose.covariance)
-            P = cov_flat[:4].reshape(2, 2)  # 2x2 position covariance
+            P = np.array([
+                [cov_flat[0], cov_flat[1]],
+                [cov_flat[6], cov_flat[7]],
+            ])
+
+            # Skip if covariance is degenerate (early startup)
+            if np.trace(P) < 1e-10:
+                return
 
             # Extract ground truth
             gt_pos = self._latest_gt.pose.pose.position
@@ -80,13 +93,16 @@ if ROS2_AVAILABLE:
 
             # Compute NEES (position only)
             nees = compute_nees(x_true, x_est, P)
+            if np.isnan(nees):
+                return
             self._nees_history.append(nees)
 
-            consistent = self.chi2_lb <= nees <= self.chi2_ub
             rmse = float(np.linalg.norm(x_true - x_est))
+            self._rmse_history.append(rmse)
+
+            consistent = self.chi2_lb <= nees <= self.chi2_ub
 
             # Running consistency rate
-            n = len(self._nees_history)
             nees_arr = np.array(self._nees_history)
             consistency_rate = float(np.mean(
                 (nees_arr >= self.chi2_lb) & (nees_arr <= self.chi2_ub)
@@ -97,6 +113,41 @@ if ROS2_AVAILABLE:
             msg.data = [nees, rmse, float(consistent), consistency_rate]
             self.metrics_pub.publish(msg)
 
+        def save_results(self):
+            """Save accumulated metrics to JSON file."""
+            if not self.output_file or len(self._nees_history) == 0:
+                return
+
+            nees_arr = np.array(self._nees_history)
+            rmse_arr = np.array(self._rmse_history)
+
+            results = {
+                "method": self.method_name,
+                "num_samples": len(self._nees_history),
+                "mean_nees": float(np.mean(nees_arr)),
+                "std_nees": float(np.std(nees_arr)),
+                "median_nees": float(np.median(nees_arr)),
+                "mean_rmse": float(np.mean(rmse_arr)),
+                "std_rmse": float(np.std(rmse_arr)),
+                "max_rmse": float(np.max(rmse_arr)),
+                "consistency_rate": float(np.mean(
+                    (nees_arr >= self.chi2_lb) & (nees_arr <= self.chi2_ub)
+                )),
+                "chi2_bounds": [float(self.chi2_lb), float(self.chi2_ub)],
+                "nees_history": nees_arr.tolist(),
+                "rmse_history": rmse_arr.tolist(),
+            }
+
+            with open(self.output_file, "w") as f:
+                json.dump(results, f, indent=2)
+
+            self.get_logger().info(
+                f"Saved results to {self.output_file} "
+                f"(NEES={results['mean_nees']:.4f}, "
+                f"Consistency={results['consistency_rate']:.2%}, "
+                f"RMSE={results['mean_rmse']:.4f})"
+            )
+
 
 def main(args=None):
     if not ROS2_AVAILABLE:
@@ -104,10 +155,16 @@ def main(args=None):
         return
     rclpy.init(args=args)
     node = EvaluationNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        node.save_results()
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
     main()
+ 
