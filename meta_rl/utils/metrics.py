@@ -13,7 +13,12 @@ def compute_nees(x_true: np.ndarray, x_est: np.ndarray, P: np.ndarray) -> float:
     For a consistent filter, E[NEES] = n_x (state dimension).
     """
     e = x_true - x_est
-    return float(e.T @ np.linalg.inv(P) @ e)
+    # Regularize near-singular covariance
+    P_reg = P + np.eye(P.shape[0]) * 1e-8
+    try:
+        return float(e.T @ np.linalg.inv(P_reg) @ e)
+    except np.linalg.LinAlgError:
+        return float('nan')
 
 
 def compute_nis(innovation: np.ndarray, S: np.ndarray) -> float:
