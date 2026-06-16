@@ -290,6 +290,14 @@ def run_episode_window(positions, headings, velocities, omega, controls, dt,
             ekf.Q = Q_true.copy()
             ekf.R = R_true.copy()
 
+        elif method.startswith("inflate_"):
+            # Fixed Q-inflation baseline: Q_eff = k * Q_nom, R unchanged
+            # Tests whether a simple heuristic multiplier achieves similar
+            # consistency to the learned policy (rebuts "just learned inflation")
+            k = float(method.split("_")[1])
+            ekf.Q = Q_NOM * k
+            # R stays at nominal
+
         elif method == "ccmetaekf" and policy is not None:
             obs = build_obs(innovs, ekf)
             ib = np.array(innovs, dtype=np.float32)
@@ -373,8 +381,13 @@ def run_full_sequence_windowed(positions, headings, velocities, omega, controls,
 def main():
     parser = argparse.ArgumentParser(description="Evaluate CC-MetaEKF on KITTI Odometry")
     parser.add_argument("--sequences", nargs="+", default=["00", "02", "05"])
-    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="ST-SIE + PID-CCPO checkpoint")
+    parser.add_argument("--checkpoint-mlp", type=str, default=None,
+                        help="MLP + PID-CCPO checkpoint (for ablation)")
     parser.add_argument("--output", type=str, default="results/kitti_results.json")
+    parser.add_argument("--inflation-only", action="store_true",
+                        help="Only run fixed Q-inflation experiment")
     args = parser.parse_args()
 
     print("=" * 65)
@@ -399,15 +412,33 @@ def main():
             ckpt = torch.load(args.checkpoint, weights_only=True, map_location="cpu")
             policy.load_state_dict(ckpt)
             policy.eval()
-            print(f"  Loaded checkpoint: {args.checkpoint}")
+            print(f"  Loaded ST-SIE checkpoint: {args.checkpoint}")
         except Exception as e:
-            print(f"  Could not load checkpoint: {e}")
+            print(f"  Could not load ST-SIE checkpoint: {e}")
             policy = None
     elif args.checkpoint:
-        print(f"  WARNING: Checkpoint not found: {args.checkpoint}")
+        print(f"  WARNING: ST-SIE checkpoint not found: {args.checkpoint}")
+
+    # Load MLP policy (for ablation)
+    policy_mlp = None
+    if args.checkpoint_mlp and Path(args.checkpoint_mlp).exists():
+        try:
+            enc_mlp = MLPEncoder(CTX_LEN * 2, 4, 32)
+            policy_mlp = Policy(OBS_DIM, ACT_DIM, enc_mlp)
+            ckpt_mlp = torch.load(args.checkpoint_mlp, weights_only=True, map_location="cpu")
+            policy_mlp.load_state_dict(ckpt_mlp)
+            policy_mlp.eval()
+            print(f"  Loaded MLP checkpoint: {args.checkpoint_mlp}")
+        except Exception as e:
+            print(f"  Could not load MLP checkpoint: {e}")
+            policy_mlp = None
 
     # Download KITTI
     poses_dir = download_kitti_poses()
+
+    # Build method list
+    base_methods = ["fixed", "sage_husa", "oracle"]
+    inflation_methods = ["inflate_1.5", "inflate_2.0", "inflate_3.0", "inflate_4.0"]
 
     for seq_id in args.sequences:
         try:
@@ -424,7 +455,10 @@ def main():
                 Q_fn, R_fn = create_noise_schedule(EP_LEN, scenario)
 
                 methods_results = {}
-                for method in ["fixed", "sage_husa", "oracle"]:
+
+                # Run base methods + inflation baselines
+                all_methods = base_methods + inflation_methods
+                for method in all_methods:
                     nees_arr = run_full_sequence_windowed(
                         positions, headings, velocities, omega, controls, dt,
                         Q_fn, R_fn, method=method,
@@ -441,6 +475,14 @@ def main():
                         f" Sage={methods_results['sage_husa']['cons']:.1%}"
                         f" Oracle={methods_results['oracle']['cons']:.1%}")
 
+                # Best inflation result for compact display
+                best_inflate = max(
+                    [(m, methods_results[m]["cons"]) for m in inflation_methods],
+                    key=lambda x: x[1]
+                )
+                line += f" BestInflate({best_inflate[0].split('_')[1]})={best_inflate[1]:.1%}"
+
+                # CC-MetaEKF (ST-SIE)
                 if policy is not None:
                     nees_arr = run_full_sequence_windowed(
                         positions, headings, velocities, omega, controls, dt,
@@ -455,6 +497,22 @@ def main():
                         "nees": float(np.median(nees_arr)),
                     }
                     line += f" Ours={cons:.1%}"
+
+                # CC-MetaEKF (MLP encoder, for ablation)
+                if policy_mlp is not None:
+                    nees_arr = run_full_sequence_windowed(
+                        positions, headings, velocities, omega, controls, dt,
+                        Q_fn, R_fn, method="ccmetaekf", policy=policy_mlp,
+                        device=device,
+                    )
+                    cons = float(np.mean(
+                        (nees_arr >= 1.237) & (nees_arr <= 14.449)
+                    ))
+                    methods_results["ccmetaekf_mlp"] = {
+                        "cons": cons,
+                        "nees": float(np.median(nees_arr)),
+                    }
+                    line += f" MLP={cons:.1%}"
 
                 print(line)
                 seq_results[scenario] = methods_results
@@ -473,14 +531,18 @@ def main():
     print(f"\n{'=' * 65}")
     print("SUMMARY")
     print(f"{'=' * 65}")
-    for method in ["fixed", "sage_husa", "oracle", "ccmetaekf"]:
+    all_method_keys = base_methods + inflation_methods + ["ccmetaekf", "ccmetaekf_mlp"]
+    for method in all_method_keys:
         vals = []
         for seq in all_results.values():
             for scenario in seq.values():
                 if method in scenario:
                     vals.append(scenario[method]["cons"])
         if vals:
-            print(f"  {method:<12s}: {np.mean(vals):.1%} ± {np.std(vals):.1%} (n={len(vals)})")
+            label = method
+            if method.startswith("inflate_"):
+                label = f"Q×{method.split('_')[1]}"
+            print(f"  {label:<15s}: {np.mean(vals):.1%} ± {np.std(vals):.1%} (n={len(vals)})")
 
     print(f"\nResults saved to: {args.output}")
 
