@@ -213,6 +213,151 @@ def train_kalmannet(n_episodes=5000, lr=1e-3, seed=42,
     return model
 
 
+# ================================================================
+# Evaluation
+# ================================================================
+
+def evaluate_kalmannet(model, positions, headings, velocities, omega, controls,
+                       dt, Q_nom, R_nom, Q_fn, R_fn, window_len=100, start_idx=0):
+    """Evaluate KalmanNet on a trajectory window.
+
+    KalmanNet predicts K directly. We maintain P for NEES computation but
+    note that this P is not derived from K — it's maintained separately
+    using Q_nom. This means the NEES may not be statistically valid for
+    KalmanNet (this is the core limitation vs CC-MetaEKF).
+    """
+    state_dim, meas_dim = 6, 2
+    end_idx = min(start_idx + window_len + 1, len(positions))
+    if end_idx - start_idx < 10:
+        return np.array([])
+
+    i0 = start_idx
+
+    # Initialize
+    x = np.array([positions[i0, 0], positions[i0, 1], headings[i0],
+                  velocities[i0, 0], velocities[i0, 1], omega[i0]])
+    x = x + np.random.normal(0, 0.2, 6)
+    P = np.eye(6) * 0.5
+
+    model.eval()
+    model.reset()
+    nees_list = []
+
+    for i in range(i0 + 1, end_idx):
+        x_true = np.array([positions[i, 0], positions[i, 1], headings[i],
+                           velocities[i, 0], velocities[i, 1], omega[i]])
+        R_true = R_fn(i - i0)
+        u = controls[i]
+
+        # --- Predict (same motion model as training EKF6D) ---
+        th, vx, vy = x[2], x[3], x[4]
+        F = np.eye(6)
+        F[0, 2] = (-vx*np.sin(th) - vy*np.cos(th))*dt
+        F[0, 3] = np.cos(th)*dt; F[0, 4] = -np.sin(th)*dt
+        F[1, 2] = (vx*np.cos(th) - vy*np.sin(th))*dt
+        F[1, 3] = np.sin(th)*dt; F[1, 4] = np.cos(th)*dt
+        F[2, 5] = dt
+
+        # State prediction with control input
+        x[0] += (vx*np.cos(th) - vy*np.sin(th)) * dt
+        x[1] += (vx*np.sin(th) + vy*np.cos(th)) * dt
+        x[2] += x[5] * dt
+        x[3] += u[0] * dt
+        x[4] += u[1] * dt
+        x[5] += u[2] * dt
+
+        P = F @ P @ F.T + Q_nom
+        P = (P + P.T) / 2
+
+        # --- Measurement ---
+        H = np.zeros((2, 6)); H[0, 0] = 1; H[1, 1] = 1
+        z = positions[i, :2] + np.random.multivariate_normal(np.zeros(2), R_true)
+        nu = z - H @ x
+        S = H @ P @ H.T + R_nom
+
+        # --- KalmanNet: predict gain ---
+        with torch.no_grad():
+            inn_t = torch.tensor(nu, dtype=torch.float32).unsqueeze(0)
+            P_diag_t = torch.tensor(
+                np.log1p(np.maximum(np.diag(P), 0)), dtype=torch.float32
+            ).unsqueeze(0)
+            S_diag_t = torch.tensor(
+                np.log1p(np.maximum(np.diag(S), 0)), dtype=torch.float32
+            ).unsqueeze(0)
+            K = model(inn_t, P_diag_t, S_diag_t).squeeze(0).numpy()
+
+        # --- Update with learned gain ---
+        x = x + K @ nu
+        I_KH = np.eye(6) - K @ H
+        P = I_KH @ P @ I_KH.T + K @ R_nom @ K.T
+        P = (P + P.T) / 2
+
+        # --- NEES ---
+        e = x_true - x
+        try:
+            nees = float(e @ np.linalg.inv(P) @ e)
+        except:
+            nees = 100.0
+        nees_list.append(nees)
+
+    return np.array(nees_list)
+
+
+def evaluate_on_kitti(checkpoint_path, sequences=["00", "02", "05", "07"]):
+    """Run KalmanNet evaluation on KITTI """
+    sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+    from eval_kitti import (
+        download_kitti_poses, load_kitti_sequence, compute_controls,
+        create_noise_schedule, Q_NOM, R_NOM, EP_LEN
+    )
+
+    print("=" * 60)
+    print("KalmanNet: KITTI Evaluation")
+    print("=" * 60)
+
+    # Load model
+    model = KalmanNetGRU(6, 2, hidden_dim=64, n_layers=2)
+    model.load_state_dict(torch.load(checkpoint_path, map_location="cpu", weights_only=True))
+    model.eval()
+    print(f"  Loaded: {checkpoint_path}")
+
+    poses_dir = download_kitti_poses()
+    scenarios = ["stationary", "abrupt", "drift", "recovery"]
+    dt = 0.1
+
+    all_cons = []
+
+    for seq_id in sequences:
+        positions, headings, velocities, omega = load_kitti_sequence(poses_dir, seq_id)
+        controls = compute_controls(velocities, omega, dt)
+        n = len(positions)
+        print(f"\n  Sequence {seq_id}: {n} frames ({n*dt:.0f}s)")
+
+        for scenario in scenarios:
+            Q_fn, R_fn = create_noise_schedule(EP_LEN, scenario)
+
+            # Windowed evaluation (same as eval_kitti.py)
+            all_nees = []
+            for start in range(0, n - 10, EP_LEN):
+                np.random.seed(42 + start)
+                model.reset()
+                window_nees = evaluate_kalmannet(
+                    model, positions, headings, velocities, omega, controls,
+                    dt, Q_NOM, R_NOM, Q_fn, R_fn,
+                    window_len=EP_LEN, start_idx=start,
+                )
+                if len(window_nees) > 0:
+                    all_nees.append(window_nees)
+
+            if all_nees:
+                nees_arr = np.concatenate(all_nees)
+                cons = float(np.mean((nees_arr >= 1.237) & (nees_arr <= 14.449)))
+                all_cons.append(cons)
+                print(f"    {scenario:12s} | KalmanNet={cons:.1%}")
+
+    if all_cons:
+        print(f"\n  MEAN: {np.mean(all_cons):.1%} ± {np.std(all_cons):.1%}")
+
 
 # ================================================================
 # Main
@@ -227,4 +372,12 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, default="checkpoints/kalmannet.pt")
     args = parser.parse_args()
 
+    if args.train:
+        train_kalmannet(n_episodes=args.episodes, save_path=args.checkpoint)
+    elif args.eval_kitti:
+        evaluate_on_kitti(args.checkpoint)
+    else:
+        print("Usage:")
+        print("  Train:  python3 baselines/kalmannet.py --train --episodes 5000")
+        print("  Eval:   python3 baselines/kalmannet.py --eval-kitti --checkpoint checkpoints/kalmannet.pt")
  
