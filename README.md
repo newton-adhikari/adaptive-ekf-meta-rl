@@ -20,9 +20,12 @@ CC-MetaEKF trains a policy via constrained PPO that observes the EKF's innovatio
 |--------|:---:|:---:|
 | Fixed EKF | 50.6% | 36.6% |
 | Sage-Husa | 50.1% | 37.4% |
+| KalmanNet | 23.0% ± 3.9% |
 | Oracle (true Q/R) | 56.4% | 49.7% |
 | Best Q-inflation (Q×4) | — | 55.9% |
 | **CC-MetaEKF (ours)** | **77.1%** | **71.3% ± 6.2%** |
+
+KalmanNet (GRU predicting Kalman gain K, trained supervised on 5000 episodes) scores below even Fixed EKF on KITTI — its learned K is decoupled from the maintained P, making NEES consistency structurally unachievable. This validates our core design choice of preserving explicit Q/R adaptation over black-box gain replacement
 
 Trained on simple 6-DOF unicycle trajectories (1 m/s, 10s episodes). Transfers zero-shot to KITTI vehicle trajectories (5-10 m/s, 110-466s, urban driving).
 
