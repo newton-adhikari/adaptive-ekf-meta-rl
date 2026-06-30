@@ -33,6 +33,56 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
+class KalmanNetGRU(nn.Module):
+    """KalmanNet: GRU-based Kalman gain predictor.
+
+    Input: innovation + filter state diagnostics (per timestep)
+    Output: Kalman gain matrix K (n × m)
+    """
+
+    def __init__(self, state_dim=6, meas_dim=2, hidden_dim=64, n_layers=2):
+        super().__init__()
+        self.state_dim = state_dim
+        self.meas_dim = meas_dim
+        self.gain_dim = state_dim * meas_dim  # K is n×m = 12
+
+        # Input: innovation (m) + log(diag(P)) (n) + log(diag(S)) (m)
+        input_dim = meas_dim + state_dim + meas_dim  # 2 + 6 + 2 = 10
+
+        self.gru = nn.GRU(input_dim, hidden_dim, n_layers, batch_first=True)
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, self.gain_dim),
+        )
+        self.hidden = None
+
+    def reset(self):
+        """Reset GRU hidden state (call at episode boundaries)."""
+        self.hidden = None
+
+    def forward(self, innovation, P_diag, S_diag):
+        """Predict Kalman gain from current innovation and filter state.
+
+        Args:
+            innovation: (batch, m) current innovation vector
+            P_diag: (batch, n) log1p(diag(P)) — predicted covariance
+            S_diag: (batch, m) log1p(diag(S)) — innovation covariance
+        Returns:
+            K: (batch, n, m) predicted Kalman gain
+        """
+        x = torch.cat([innovation, P_diag, S_diag], dim=-1)
+        x = x.unsqueeze(1)  # (batch, 1, input_dim) — single timestep
+
+        # Detach hidden to prevent backprop through previous optimizer steps
+        if self.hidden is not None:
+            self.hidden = self.hidden.detach()
+
+        out, self.hidden = self.gru(x, self.hidden)
+        K_flat = self.fc(out.squeeze(1))
+        K = K_flat.reshape(-1, self.state_dim, self.meas_dim)
+        return K
+
 
 # ================================================================
 # Main
