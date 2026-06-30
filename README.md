@@ -172,12 +172,6 @@ python3 scripts/eval_kitti.py --checkpoint results/run_s42/best_stsie_pid_s42.pt
 - **100-step horizon.** Cannot perform minutes-scale adaptation without windowed resets.
 - **Position-only observations.** Does not cover IMU/LiDAR multi-sensor fusion.
 
-## Work in Progress
-
-- [ ] KalmanNet comparison on the same system model
-- [ ] Extension to 3D observations (IMU/GPS fusion, 15-state)
-- [ ] Curriculum learning
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
