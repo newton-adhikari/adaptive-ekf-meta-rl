@@ -23,3 +23,28 @@ Reference:
   for Partially Known Dynamics," IEEE TSP, 2022.
 
 """
+
+import numpy as np
+import torch
+import torch.nn as nn
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+
+# ================================================================
+# Main
+# ================================================================
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="KalmanNet baseline")
+    parser.add_argument("--train", action="store_true", help="Train KalmanNet")
+    parser.add_argument("--eval-kitti", action="store_true", help="Evaluate on KITTI")
+    parser.add_argument("--episodes", type=int, default=5000)
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/kalmannet.pt")
+    args = parser.parse_args()
+
+ 
